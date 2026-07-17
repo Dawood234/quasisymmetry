@@ -582,8 +582,48 @@ if __name__=="__main__":
     parser.add_argument(
         "--sector_switch_maxiter",
         type=int,
-        default=5,
+        default=2,
         help="maximum sector switches for switching_sector mode",
+    )
+    parser.add_argument("--sector_bond_dim", type=int, default=100)
+    parser.add_argument("--sector_sweeps", type=int, default=6)
+    parser.add_argument("--sector_penalty", type=float, default=30.0)
+    parser.add_argument(
+        "--sector_gradient",
+        choices=("analytic", "finite_difference"),
+        default="analytic",
+        help=(
+            "gradient for DMRG switching-sector orbital optimization; "
+            "analytic uses one sector solve plus Block2 RDM contractions"
+        ),
+    )
+    parser.add_argument("--min_dominant_sectors", type=int, default=8)
+    parser.add_argument("--max_dominant_sectors", type=int, default=16)
+    parser.add_argument(
+        "--reference_sweeps",
+        type=int,
+        default=20,
+        help="sweeps used to prepare the parent DMRG reference",
+    )
+    parser.add_argument(
+        "--objective_store",
+        default=None,
+        help="scratch directory for switching-sector optimizer MPS files",
+    )
+    parser.add_argument(
+        "--restart_state",
+        default=None,
+        help="JSON restart state for switching-sector DMRG optimization",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume switching-sector optimization from --restart_state",
+    )
+    parser.add_argument(
+        "--no_cleanup_optimizer_mps",
+        action="store_true",
+        help="keep all temporary optimizer MPS files instead of pruning old tags",
     )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--outname", default=None)
@@ -604,15 +644,22 @@ if __name__=="__main__":
     rotation_pairs = None
     rotation_irreps = None
 
-    # ── MPS-native path (--reference dmrg; NC / variance only) ────────────────
+    # ── MPS-native path ───────────────────────────────────────────────────────
     if args.reference == "dmrg":
         from src.dmrg_costs import MultiplyConfig, build_dmrg_orbital_costs
-        from src.dmrg_solver import DMRGConfig
+        from src.dmrg_solver import DMRGConfig, solve_or_load_ground_state
+        from src.dmrg_decoupled_energy import (
+            load_json,
+            make_context,
+            optimize_with_dmrg_sector_switching,
+            rotated_solver,
+            rotation_key,
+            screen_sector_labels,
+        )
 
-        if args.cost_function not in ("NC", "variance"):
+        if args.cost_function not in ("NC", "variance", "switching_sector"):
             parser.error(
-                "--reference dmrg only supports cost_function NC or variance "
-                "(decoupled / sector modes need --reference fci or hf)"
+                "--reference dmrg supports NC, variance, or switching_sector"
             )
         if args.sector_backend != "determinant":
             parser.error(
@@ -636,7 +683,7 @@ if __name__=="__main__":
             store_dir=store_dir,
             config=DMRGConfig(
                 max_bond_dim=args.bond_dim,
-                n_sweeps=max(12, args.bond_dim // 20 + 8),
+                n_sweeps=args.reference_sweeps,
             ),
             multiply=MultiplyConfig(
                 bond_dim=args.multiply_bond_dim,
@@ -659,36 +706,136 @@ if __name__=="__main__":
         print("DMRG reference energy: {0:4.6f}".format(dmrg_result.energy))
         print("wavefunction store: {}".format(dmrg_result.store_dir))
 
-        f = costs.cost_function(args.cost_function)
         x0 = (
             np.loadtxt(args.x0)
             if args.x0
             else np.zeros(n_params(solver.n_sites, rotation_pairs))
         )
-        cost_before = f(x0)
-        print("before optimization: {0:4.6f}".format(cost_before))
+        x0 = np.atleast_1d(np.asarray(x0, dtype=float))
 
-        t_start = time.time()
-        if args.optimizer_maxiter > 0:
-            res = scipy.optimize.minimize(
-                f,
-                x0,
-                method="L-BFGS-B",
-                options={"maxiter": args.optimizer_maxiter},
-                callback=callback if args.verbose else None,
+        p = Path(args.molpath)
+        if args.outname:
+            outname = args.outname
+        else:
+            outname = (
+                "OO_" + p.parts[-1] + "_"
+                + time.strftime("%Y%m%d_%H%M%S", time.localtime())
+                + "_" + str(uuid4())[:6] + ".json"
+            )
+        Path(outname).parent.mkdir(parents=True, exist_ok=True)
+
+        switching_history = []
+        screened_labels = []
+        sector_weights = {}
+        restart_state = None
+        objective_cache = None
+
+        if args.cost_function in ("NC", "variance"):
+            f = costs.cost_function(args.cost_function)
+            cost_before = f(x0)
+            print("before optimization: {0:4.6f}".format(cost_before))
+            t_start = time.time()
+            if args.optimizer_maxiter > 0:
+                res = scipy.optimize.minimize(
+                    f,
+                    x0,
+                    method="L-BFGS-B",
+                    options={"maxiter": args.optimizer_maxiter},
+                    callback=callback if args.verbose else None,
+                )
+                elapsed = time.time() - t_start
+            else:
+                res = scipy.optimize.OptimizeResult(
+                    x=x0,
+                    fun=cost_before,
+                    success=False,
+                    nit=0,
+                    nfev=0,
+                    message="STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT",
+                )
+                elapsed = 0.0
+        else:
+            objective_store = Path(
+                args.objective_store
+                or (Path(outname).parent / (Path(outname).stem + "_optimizer_mps"))
+            )
+            objective_store.mkdir(parents=True, exist_ok=True)
+            restart_state = Path(
+                args.restart_state or (str(outname) + ".restart.json")
+            )
+            objective_cache = objective_store / "objective_cache.json"
+
+            resume_label = None
+            if args.resume and restart_state.exists():
+                saved = load_json(restart_state, {})
+                if saved.get("rotation") is not None:
+                    x0 = np.asarray(saved["rotation"], dtype=float)
+                if saved.get("sector") is not None:
+                    resume_label = tuple(int(value) for value in saved["sector"])
+                print("resuming from", restart_state, flush=True)
+
+            if np.max(np.abs(x0)) < 1.0e-15:
+                screening_solver = solver
+                screening_tag = dmrg_result.mps_tag
+            else:
+                screening_solver = rotated_solver(
+                    solver, x0, rotation_pairs, objective_store, args.n_threads
+                )
+                screening_tag = "SCREEN_" + rotation_key(x0)
+                screening_result = solve_or_load_ground_state(
+                    screening_solver,
+                    config=DMRGConfig(
+                        max_bond_dim=args.bond_dim,
+                        n_sweeps=args.reference_sweeps,
+                        mps_tag=screening_tag,
+                    ),
+                    reuse=True,
+                )
+                screening_tag = screening_result.mps_tag
+
+            screened_labels, sector_weights = screen_sector_labels(
+                screening_solver,
+                parity_matrix,
+                reference_tag=screening_tag,
+                minimum=args.min_dominant_sectors,
+                maximum=args.max_dominant_sectors,
+            )
+            if resume_label is not None and resume_label not in screened_labels:
+                screened_labels.insert(0, resume_label)
+                screened_labels = screened_labels[: args.max_dominant_sectors]
+            print("screened sectors:", screened_labels, flush=True)
+
+            context = make_context(
+                solver,
+                parity_matrix,
+                rotation_pairs,
+                objective_store,
+                objective_cache,
+                bond_dim=args.sector_bond_dim,
+                sweeps=args.sector_sweeps,
+                penalty=args.sector_penalty,
+                n_threads=args.n_threads,
+                cleanup_mps=not args.no_cleanup_optimizer_mps,
+            )
+            t_start = time.time()
+            res, switching_history, initial_scan = (
+                optimize_with_dmrg_sector_switching(
+                    context,
+                    screened_labels,
+                    x0,
+                    maxiter=args.optimizer_maxiter,
+                    max_switches=args.sector_switch_maxiter,
+                    state_path=restart_state,
+                    callback=callback if args.verbose else None,
+                    initial_label=resume_label,
+                    use_analytic_gradient=(args.sector_gradient == "analytic"),
+                )
             )
             elapsed = time.time() - t_start
-            print(res.message)
-            print("optimized: {0:4.6f}".format(res.fun))
-        else:
-            res = scipy.optimize.OptimizeResult()
-            res.x = x0
-            res.fun = cost_before
-            res.success = False
-            res.nit = 0
-            res.nfev = 0
-            elapsed = 0.0
-            res.message = "STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT"
+            cost_before = float(initial_scan[0][0])
+
+        print(res.message)
+        print("optimized: {0:4.12f}".format(res.fun))
 
         if args.output_fcidump is not None:
             moldata = load_moldata(args.molpath)
@@ -703,15 +850,6 @@ if __name__=="__main__":
                 two_body_integrals=rh.two_body_tensor,
             ).to_fcidump(args.output_fcidump)
 
-        p = Path(args.molpath)
-        if args.outname:
-            outname = args.outname
-        else:
-            outname = (
-                "OO_" + p.parts[-1] + "_"
-                + time.strftime("%Y%m%d_%H%M%S", time.localtime())
-                + "_" + str(uuid4())[:6] + ".json"
-            )
         out_data = {
             "reference": "dmrg",
             "backend": optimize_cost_engine("dmrg"),
@@ -720,16 +858,32 @@ if __name__=="__main__":
             "converged": bool(res.success),
             "nit": int(res.nit),
             "nfev": int(res.nfev),
+            "njev": int(getattr(res, "njev", 0)),
             "elapsed": float(elapsed),
             "message": str(res.message),
             "dmrg_energy": float(dmrg_result.energy),
             "wavefunction_dir": str(dmrg_result.store_dir),
             "rotation": res.x.tolist(),
             "orbital_rotation": args.orbital_rotation,
+            "parity": args.parity,
+            "screened_sector_labels": [list(label) for label in screened_labels],
+            "sector_weights": sector_weights,
+            "switching_history": switching_history,
+            "selected_sector": (
+                list(getattr(res, "sector_label", ()))
+                if args.cost_function == "switching_sector"
+                else None
+            ),
+            "restart_state": None if restart_state is None else str(restart_state),
+            "objective_cache": (
+                None if objective_cache is None else str(objective_cache)
+            ),
+            "sector_gradient": args.sector_gradient,
         }
         if rotation_irreps is not None:
             out_data["irreps"] = np.asarray(rotation_irreps, dtype=int).tolist()
-        with open(outname, "a") as fp:
+        np.save(str(outname) + ".rotation.npy", np.asarray(res.x, dtype=float))
+        with open(outname, "w") as fp:
             json.dump(vars(args) | out_data, fp, indent=2)
         print("results written to", outname)
         raise SystemExit(0)

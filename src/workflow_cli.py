@@ -33,10 +33,11 @@ OPTIMIZE_EPILOG = """
 -----------------------------------------------------------
   --reference fci     PySCF FCI CI vector + ffsim costs (default)
   --reference hf      Hartree-Fock CI vector + ffsim costs
-  --reference dmrg    Block2 MPS + MPS-native NC/variance
+  --reference dmrg    Block2 MPS + MPS-native NC/variance or
+                      switching-sector decoupled-energy optimization
 
-  Sector energy costs (decoupled / fixed_sector / switching_sector)
-  require --reference fci or hf (CI / ffsim path).
+  The decoupled and fixed_sector costs currently require --reference fci or
+  hf. The switching_sector cost also supports --reference dmrg.
 
 --orbital_rotation packing
 --------------------------

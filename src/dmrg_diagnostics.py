@@ -61,6 +61,13 @@ class CoupledDiagnostic:
     chosen: list[tuple[tuple[int, ...], int]]
     e_reference: float
     e_decoupled: float
+    sector_label_count: int = 0
+    candidate_state_count: int = 0
+    order_indices: list[int] = field(default_factory=list)
+    energies: list[float] = field(default_factory=list)
+    k_pt: int | None = None
+    hermiticity_residual: float = 0.0
+    variational_from_anchor: bool = False
 
 
 @dataclass
@@ -211,6 +218,35 @@ def one_shot_coupled_energy_mps(
     return result.as_tuple()
 
 
+def one_shot_coupled_result_mps(
+    solver: Block2DMRGSolver,
+    states: Sequence[SectorState],
+    *,
+    e_exact: float | None = None,
+    tol: float = CHEMICAL_PRECISION,
+    tau_pt: float = DEFAULT_TAU_PT,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    degeneracy_floor: float = COUPLED_ENERGY_DEGENERACY_FLOOR,
+    max_total_vectors: int | None = None,
+):
+    """Return the complete one-shot PT result and candidate Hamiltonian."""
+    if not states:
+        return None, np.zeros((0, 0), dtype=np.complex128)
+    h_coupled = build_mps_candidate_hamiltonian(solver, states)
+    keys = [(state.sector_label, state.block_index) for state in states]
+    result = one_shot_from_hamiltonian(
+        h_coupled,
+        e_exact=e_exact,
+        tol=tol,
+        tau_pt=tau_pt,
+        block_size=block_size,
+        degeneracy_floor=degeneracy_floor,
+        keys=keys,
+        max_total_vectors=max_total_vectors,
+    )
+    return result, h_coupled
+
+
 def coupled_energy_dmrg(
     solver: Block2DMRGSolver,
     parity_matrix: np.ndarray,
@@ -244,11 +280,23 @@ def coupled_energy_dmrg(
         penalty=penalty,
         config=config,
     )
-    e_coupled, k, converged, chosen = one_shot_coupled_energy_mps(
+    result, h_coupled = one_shot_coupled_result_mps(
         solver,
         states,
         e_exact=e_reference,
         tol=chemical_precision,
+    )
+    if result is None:
+        e_coupled, k, converged, chosen = None, 0, False, []
+        order_indices, energies, k_pt = [], [], None
+    else:
+        e_coupled, k, converged, chosen = result.as_tuple()
+        order_indices = [int(index) for index in result.order_indices]
+        energies = [float(energy) for energy in result.energies]
+        k_pt = None if result.K_pt is None else int(result.K_pt)
+    hermiticity = float(np.max(np.abs(h_coupled - h_coupled.conj().T))) if h_coupled.size else 0.0
+    variational = (
+        e_coupled is not None and float(e_coupled) <= float(e_decoupled) + 1.0e-9
     )
     return CoupledDiagnostic(
         e_coupled=e_coupled,
@@ -257,6 +305,13 @@ def coupled_energy_dmrg(
         chosen=chosen,
         e_reference=e_reference,
         e_decoupled=e_decoupled,
+        sector_label_count=len(sector_labels),
+        candidate_state_count=len(states),
+        order_indices=order_indices,
+        energies=energies,
+        k_pt=k_pt,
+        hermiticity_residual=hermiticity,
+        variational_from_anchor=bool(variational),
     )
 
 
@@ -327,6 +382,12 @@ def run_dmrg_metrics(
             chosen=[(decoupled.best_sector, 0)],
             e_reference=gs.energy,
             e_decoupled=decoupled.e_decoupled,
+            sector_label_count=len(decoupled.sector_energies),
+            candidate_state_count=1,
+            order_indices=[0],
+            energies=[float(decoupled.e_decoupled)],
+            k_pt=1,
+            variational_from_anchor=True,
         )
 
     ent = entanglement_diagnostic(solver) if compute_entanglement else None
@@ -360,6 +421,15 @@ def format_metrics_report(report: DMRGMetricsReport) -> list[str]:
             lines.append(f"E_coupled {report.coupled.e_coupled:4.6f}")
         lines.append(f"K {report.coupled.k}")
         lines.append(f"converged {report.coupled.converged}")
+        lines.append(f"sector_label_count {report.coupled.sector_label_count}")
+        lines.append(f"candidate_state_count {report.coupled.candidate_state_count}")
+        lines.append(f"K_PT {report.coupled.k_pt}")
+        lines.append(
+            f"hermiticity_residual {report.coupled.hermiticity_residual:.3e}"
+        )
+        lines.append(
+            f"variational_from_anchor {report.coupled.variational_from_anchor}"
+        )
         for key in report.coupled.chosen:
             lines.append(str(key))
     if report.entanglement is not None:

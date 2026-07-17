@@ -250,3 +250,47 @@ def build_dmrg_orbital_costs(
         pairs=pairs,
     )
     return costs, result, solver
+
+
+def commutator_scores_by_row(costs, x):
+    """Return one MPS-native NC score for every parity row.
+
+    This is the per-generator form of :meth:`DMRGOrbitalCosts.commutator`.
+    The expensive reference action ``H|psi>`` is cached once and reused for
+    all rows, which is required when ranking a seniority/quartet pool.
+    """
+    costs._eval_count += 1
+    costs._ensure_eta()
+    rotation = rotation_from_parameters(
+        np.asarray(x, dtype=float), costs.solver.n_sites, costs.pairs
+    )
+    scores = []
+
+    total_rows = len(costs.parity_matrix)
+    for index, row in enumerate(costs.parity_matrix, start=1):
+        print(f"[NC score] candidate {index}/{total_rows}", flush=True)
+        phi = costs._apply_symmetry(row, rotation, costs.ket, "SCORE_PHI")
+        xi = costs._apply_symmetry(row, rotation, costs._eta, "SCORE_XI")
+        chi = costs._apply(costs._h_mpo, phi, "SCORE_CHI")
+        c2 = costs.solver.mps_norm2(chi)
+        x2 = costs.solver.mps_norm2(xi)
+        cx = costs.solver.mps_overlap(chi, xi)
+        score = c2 + x2 - 2.0 * float(np.real(cx))
+        scores.append(max(0.0, float(score)))
+
+    return np.asarray(scores, dtype=float)
+
+
+def parity_expectations_by_row(costs, x, parity_matrix):
+    """Return ``<psi|U^dagger S_k U|psi>`` for selected parity rows."""
+    rotation = rotation_from_parameters(
+        np.asarray(x, dtype=float), costs.solver.n_sites, costs.pairs
+    )
+    expectations = []
+    rows = np.atleast_2d(np.asarray(parity_matrix, dtype=int))
+    for index, row in enumerate(rows, start=1):
+        print(f"[generator sign] selected {index}/{len(rows)}", flush=True)
+        phi = costs._apply_symmetry(row, rotation, costs.ket, "SIGN_PHI")
+        value = costs.solver.mps_overlap(costs.ket, phi)
+        expectations.append(float(np.real(value)))
+    return np.asarray(expectations, dtype=float)

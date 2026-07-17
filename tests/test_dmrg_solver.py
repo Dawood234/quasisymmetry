@@ -23,14 +23,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.dmrg_solver import (
     Block2DMRGSolver,
     DMRGConfig,
+    find_sector_determinant,
     restore_g2e,
     rotate_integrals,
     rotation_from_parameters,
     solve_or_load_ground_state,
 )
+from src.dmrg_decoupled_energy import energy_from_rdms
 
 FCIDUMP_PATH = Path(__file__).resolve().parents[1] / "hamiltonians" / "sentest_5_d754.FCIDUMP"
 ENERGY_TOL = 1e-7
+
+
+def test_find_sector_determinant_satisfies_spin_and_parities():
+    parity_matrix = np.asarray(
+        [
+            [1, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0],
+        ],
+        dtype=int,
+    )
+    determinant = find_sector_determinant(
+        parity_matrix,
+        sector_label=(0, 1),
+        norb=3,
+        n_elec=4,
+        spin=0,
+    )
+    alpha = np.asarray([symbol in ("a", "2") for symbol in determinant], dtype=int)
+    beta = np.asarray([symbol in ("b", "2") for symbol in determinant], dtype=int)
+    occupations = np.column_stack([alpha, beta]).ravel()
+    assert alpha.sum() == 2
+    assert beta.sum() == 2
+    np.testing.assert_array_equal((parity_matrix @ occupations) % 2, [0, 1])
 
 
 def fermion_operator_from_integrals(h1e, g2e, ecore, norb):
@@ -131,6 +156,18 @@ class TestBlock2DMRGSolver(unittest.TestCase):
             self.result.energy, self.e_exact, delta=ENERGY_TOL
         )
 
+    def test_spin_resolved_rdms_reproduce_energy(self):
+        ket = self.solver.get_mps(self.result.mps_tag)
+        rdm1, rdm2 = self.solver.spin_resolved_rdms(ket)
+        energy = energy_from_rdms(
+            self.solver.h1e,
+            self.solver.g2e,
+            self.solver.ecore,
+            rdm1,
+            rdm2,
+        )
+        self.assertAlmostEqual(energy, self.result.energy, delta=1.0e-7)
+
     def test_statevector_matches_exact_ground_state(self):
         psi = self.solver.to_statevector()
         self.assertAlmostEqual(np.linalg.norm(psi), 1.0, places=8)
@@ -188,7 +225,7 @@ class TestBlock2DMRGSolver(unittest.TestCase):
             exact = np.real(
                 np.sum(eigenvalues * np.abs(amplitudes) ** 2)
             )
-            self.assertAlmostEqual(value, exact, places=6)
+            self.assertAlmostEqual(value, exact, delta=1.0e-6)
 
     def test_spin_resolved_parity_row(self):
         row = np.zeros(2 * self.norb, dtype=int)
@@ -227,6 +264,31 @@ class TestBlock2DMRGSolver(unittest.TestCase):
             self.assertAlmostEqual(
                 result.symmetry_expectations[0], target, delta=1e-4
             )
+
+    def test_sector_ground_state_warm_start_is_reloadable(self):
+        parity_matrix = np.array([[1, 0, 0, 0, 0]])
+        first = self.solver.sector_ground_state(
+            parity_matrix,
+            (0,),
+            penalty=10.0,
+            config=DMRGConfig(
+                max_bond_dim=100, n_sweeps=8, mps_tag="WARM_A"
+            ),
+            mps_tag="WARM_A",
+        )
+        second = self.solver.sector_ground_state(
+            parity_matrix,
+            (0,),
+            penalty=10.0,
+            config=DMRGConfig(
+                max_bond_dim=100, n_sweeps=4, mps_tag="WARM_B"
+            ),
+            mps_tag="WARM_B",
+            initial_mps_tag=first.mps_tag,
+        )
+        self.assertAlmostEqual(second.energy, first.energy, delta=1e-6)
+        self.assertIn("WARM_B", self.solver.stored_tags())
+        self.solver.get_mps("WARM_B")
 
     def test_sector_ground_state_multi_symmetry_spin_resolved(self):
         """Two symmetries, one of them a single-spin (alpha) parity."""

@@ -271,7 +271,10 @@ def _run_dmrg_from_oo_json(input_data, args, outname, out_data):
     report = run_dmrg_metrics(
         solver,
         parity_matrix,
-        config=DMRGConfig(max_bond_dim=args.bond_dim),
+        config=DMRGConfig(
+            max_bond_dim=args.bond_dim,
+            n_sweeps=args.dmrg_sweeps,
+        ),
         penalty=args.penalty,
         max_sectors=args.max_sectors,
         states_per_sector=states_per_sector,
@@ -294,10 +297,23 @@ def _run_dmrg_from_oo_json(input_data, args, outname, out_data):
         out_data["E_coupled"] = report.coupled.e_coupled
         out_data["K"] = report.coupled.k
         out_data["converged"] = report.coupled.converged
+        out_data["sector_label_count"] = report.coupled.sector_label_count
+        out_data["candidate_state_count"] = report.coupled.candidate_state_count
+        out_data["coupled_K_curve"] = {
+            "order": report.coupled.order_indices,
+            "energies": report.coupled.energies,
+            "K_PT": report.coupled.k_pt,
+        }
+        out_data["hermiticity_residual"] = report.coupled.hermiticity_residual
+        out_data["variational_from_anchor"] = (
+            report.coupled.variational_from_anchor
+        )
         out_data["sector_eigenstates"] = [
             [list(label), int(idx)] for label, idx in report.coupled.chosen
         ]
-    with open(outname, "a") as fp:
+    # Overwrite a partial file left by an interrupted stage so ``--resume``
+    # always produces one valid JSON document.
+    with open(outname, "w") as fp:
         json.dump(out_data, fp, indent=2)
     print("results written to", outname)
 
@@ -756,6 +772,12 @@ if __name__ == "__main__":
     add_metrics_workflow_args(parser)
     parser.add_argument("--penalty", type=float, default=30.0,
                         help="sector penalty for DMRG E_decoupled / K")
+    parser.add_argument(
+        "--dmrg_sweeps",
+        type=int,
+        default=20,
+        help="sweeps for parent and sector DMRG solves",
+    )
     parser.add_argument("--max_sectors", type=int, default=16,
                         help="max sectors to scan in DMRG diagnostics")
     parser.add_argument("--reorder", choices=("fiedler", "gaopt"), default=None,

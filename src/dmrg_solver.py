@@ -182,6 +182,94 @@ def normalize_nelec(nelec, ms2: int | None = None) -> tuple[int, int]:
     return int(nelec), int(ms2 or 0)
 
 
+def find_sector_determinants(
+    parity_matrix: np.ndarray,
+    sector_label: Sequence[int],
+    norb: int,
+    n_elec: int,
+    spin: int,
+    maximum: int = 32,
+) -> list[str]:
+    """Find a small fixed-spin determinant seed in one parity sector.
+
+    The depth-first search stops after ``maximum`` valid determinants.  It
+    does not enumerate the fixed-spin determinant basis or solve other sectors.
+    """
+    parity_matrix = np.atleast_2d(np.asarray(parity_matrix, dtype=int))
+    label = tuple(int(value) for value in sector_label)
+    if len(label) != parity_matrix.shape[0]:
+        raise ValueError("sector_label length must match parity rows")
+    if parity_matrix.shape[1] == norb:
+        alpha = parity_matrix % 2
+        beta = parity_matrix % 2
+    elif parity_matrix.shape[1] == 2 * norb:
+        alpha = parity_matrix[:, 0::2] % 2
+        beta = parity_matrix[:, 1::2] % 2
+    else:
+        raise ValueError("parity matrix columns must be norb or 2 * norb")
+
+    n_alpha = (int(n_elec) + int(spin)) // 2
+    n_beta = int(n_elec) - n_alpha
+    zero_parity = tuple(0 for _ in label)
+    stack = [(0, 0, 0, zero_parity, "")]
+    local_states = (
+        (1, 1, "2"),
+        (1, 0, "a"),
+        (0, 1, "b"),
+        (0, 0, "0"),
+    )
+    determinants = []
+
+    while stack and len(determinants) < int(maximum):
+        orbital, used_alpha, used_beta, parity, symbols = stack.pop()
+        if orbital == norb:
+            if used_alpha == n_alpha and used_beta == n_beta and parity == label:
+                determinants.append(symbols)
+            continue
+
+        remaining_after = norb - orbital - 1
+        for add_alpha, add_beta, symbol in local_states:
+            next_alpha = used_alpha + add_alpha
+            next_beta = used_beta + add_beta
+            if next_alpha > n_alpha or next_beta > n_beta:
+                continue
+            if next_alpha + remaining_after < n_alpha:
+                continue
+            if next_beta + remaining_after < n_beta:
+                continue
+            next_parity = tuple(
+                int(
+                    parity[k]
+                    ^ (add_alpha * int(alpha[k, orbital]))
+                    ^ (add_beta * int(beta[k, orbital]))
+                )
+                for k in range(len(label))
+            )
+            stack.append(
+                (orbital + 1, next_alpha, next_beta, next_parity, symbols + symbol)
+            )
+
+    if not determinants:
+        raise ValueError(
+            f"sector {label} has no determinant with "
+            f"N_alpha={n_alpha}, N_beta={n_beta}"
+        )
+    return determinants
+
+
+def find_sector_determinant(
+    parity_matrix: np.ndarray,
+    sector_label: Sequence[int],
+    norb: int,
+    n_elec: int,
+    spin: int,
+) -> str:
+    """Return one determinant in a requested fixed-spin parity sector."""
+    return find_sector_determinants(
+        parity_matrix, sector_label, norb, n_elec, spin, maximum=1
+    )[0]
+
+
 @dataclass(frozen=True)
 class DMRGConfig:
     """Sweep schedule and runtime settings for a DMRG solve."""
@@ -901,13 +989,39 @@ class Block2DMRGSolver:
     # ------------------------------------------------------------------
 
     def _run_dmrg(
-        self, mpo, config: DMRGConfig, tag: str, nroots: int = 1
+        self,
+        mpo,
+        config: DMRGConfig,
+        tag: str,
+        nroots: int = 1,
+        initial_mps_tag: str | None = None,
+        initial_determinants: Sequence[str] | None = None,
+        projected_mps_tags: Sequence[str] | None = None,
+        projection_weight: float = 10.0,
     ) -> tuple[float | list[float], float]:
         self._activate()
         bond_dims, noises, thrds = config.schedule()
-        ket = self.driver.get_random_mps(
-            tag=tag, bond_dim=bond_dims[0], nroots=nroots
-        )
+        if initial_determinants is not None:
+            coefficients = np.ones(len(initial_determinants), dtype=float)
+            coefficients /= np.linalg.norm(coefficients)
+            ket = self.driver.get_mps_from_csf_coefficients(
+                list(initial_determinants),
+                coefficients,
+                tag,
+                full_fci=True,
+                iprint=0,
+            )
+        elif initial_mps_tag is not None and initial_mps_tag in self.stored_tags():
+            initial = self.get_mps(initial_mps_tag, nroots=nroots)
+            ket = initial.deep_copy(tag)
+        else:
+            ket = self.driver.get_random_mps(
+                tag=tag, bond_dim=bond_dims[0], nroots=nroots
+            )
+        projected_mps = [
+            self.get_mps(projected_tag)
+            for projected_tag in (projected_mps_tags or [])
+        ]
         start = time.perf_counter()
         energy = self.driver.dmrg(
             mpo,
@@ -917,8 +1031,19 @@ class Block2DMRGSolver:
             bond_dims=bond_dims,
             noises=noises,
             thrds=thrds,
+            proj_mpss=projected_mps or None,
+            proj_weights=(
+                [float(projection_weight)] * len(projected_mps)
+                if projected_mps else None
+            ),
             iprint=0,
         )
+        # ``deep_copy`` creates a valid warm-start MPS but does not write the
+        # tag-specific info file that ``load_mps`` needs later.  Persist both
+        # random and warm-started states in the same format.
+        # The sweep already writes the MPS tensors.  Only the tag-specific
+        # info file is missing for a state created through ``deep_copy``.
+        ket.info.save_data(str(self.store_dir / f"{tag}-mps_info.bin"))
         elapsed = time.perf_counter() - start
         if nroots == 1:
             return float(energy), elapsed
@@ -951,6 +1076,8 @@ class Block2DMRGSolver:
         penalty: float = 10.0,
         config: DMRGConfig | None = None,
         verify_tol: float = 1e-2,
+        mps_tag: str | None = None,
+        initial_mps_tag: str | None = None,
     ) -> DMRGResult:
         """Sector-restricted ground state of the decoupled Hamiltonian.
 
@@ -962,22 +1089,56 @@ class Block2DMRGSolver:
         sector within ``verify_tol`` (e.g. because the penalty was too weak).
         """
         sector_label = tuple(int(b) for b in sector_label)
-        tag = "SECTOR_" + "".join(map(str, sector_label))
+        tag = mps_tag or ("SECTOR_" + "".join(map(str, sector_label)))
         config = config or DMRGConfig(mps_tag=tag)
         if config.mps_tag != tag:
             config = DMRGConfig(**{**asdict(config), "mps_tag": tag})
 
         mpo = self.sector_hamiltonian_mpo(parity_matrix, sector_label, penalty)
-        energy, elapsed = self._run_dmrg(mpo, config, tag)
+        target_determinants = find_sector_determinants(
+            parity_matrix,
+            sector_label,
+            self.n_sites,
+            self.n_elec,
+            self.spin,
+            maximum=32,
+        )
+        warm_start_available = (
+            initial_mps_tag is not None and initial_mps_tag in self.stored_tags()
+        )
+        energy, elapsed = self._run_dmrg(
+            mpo,
+            config,
+            tag,
+            initial_mps_tag=initial_mps_tag,
+            initial_determinants=(
+                None if warm_start_available else target_determinants
+            ),
+        )
 
         ket = self.get_mps(tag)
         expectations = self.symmetry_expectations(parity_matrix, ket=ket)
         targets = np.array([(-1.0) ** b for b in sector_label])
         if not np.allclose(expectations, targets, atol=verify_tol):
             logger.warning(
-                "sector %s not clean: <S_k> = %s (targets %s); "
-                "consider increasing penalty=%g",
-                sector_label, expectations, targets, penalty,
+                "warm-started sector %s was not clean; retrying from a target "
+                "determinant",
+                sector_label,
+            )
+            retry_energy, retry_elapsed = self._run_dmrg(
+                mpo,
+                config,
+                tag,
+                initial_determinants=target_determinants,
+            )
+            energy = retry_energy
+            elapsed += retry_elapsed
+            ket = self.get_mps(tag)
+            expectations = self.symmetry_expectations(parity_matrix, ket=ket)
+        if not np.allclose(expectations, targets, atol=verify_tol):
+            raise RuntimeError(
+                f"sector {sector_label} targeting failed: <S_k>={expectations}, "
+                f"targets={targets}, penalty={penalty}"
             )
 
         # Report the bare electronic energy in this state (penalty contribution
@@ -1006,44 +1167,67 @@ class Block2DMRGSolver:
         config: DMRGConfig | None = None,
         verify_tol: float = 1e-2,
     ) -> list[tuple[float, str]]:
-        """Lowest ``nroots`` eigenstates of a parity sector via state-averaged DMRG.
+        """Lowest ``nroots`` states from sequential sector-targeted DMRG.
 
-        Returns a list of ``(bare_energy, mps_tag)`` sorted by energy. Each
-        extracted single-root MPS is stored under ``{sector_tag}_r{i}``.
+        Every root starts from determinants in the requested parity sector.
+        Previously converged roots are projected out in subsequent solves.
+        This is slower than an unrestricted random state-averaged solve, but it
+        prevents the roots from silently converging to another parity sector.
         """
         if nroots < 1:
             raise ValueError("nroots must be >= 1")
         sector_label = tuple(int(b) for b in sector_label)
-        tag = "SECTOR_" + "".join(map(str, sector_label))
-        config = config or DMRGConfig(mps_tag=tag)
-        if config.mps_tag != tag:
-            config = DMRGConfig(**{**asdict(config), "mps_tag": tag})
-
+        base_tag = "SECTOR_" + "".join(map(str, sector_label))
+        config = config or DMRGConfig(mps_tag=base_tag)
         mpo = self.sector_hamiltonian_mpo(parity_matrix, sector_label, penalty)
-        energies, elapsed = self._run_dmrg(mpo, config, tag, nroots=nroots)
-        if nroots == 1:
-            energies = [float(energies)]
-
-        multi = self.get_mps(tag, nroots=nroots)
+        target_determinants = find_sector_determinants(
+            parity_matrix,
+            sector_label,
+            self.n_sites,
+            self.n_elec,
+            self.spin,
+            maximum=max(32, 4 * int(nroots)),
+        )
         targets = np.array([(-1.0) ** b for b in sector_label])
         results: list[tuple[float, str]] = []
-        for iroot, _penalized_energy in enumerate(energies):
-            root_tag = f"{tag}_r{iroot}"
-            ket = self.split_root(multi, iroot, root_tag)
+        previous_tags = []
+        for iroot in range(int(nroots)):
+            root_tag = f"{base_tag}_r{iroot}"
+            root_config = DMRGConfig(
+                **{**asdict(config), "mps_tag": root_tag}
+            )
+            anchor_tag = (
+                base_tag
+                if iroot == 0 and base_tag in self.stored_tags()
+                else None
+            )
+            _penalized_energy, elapsed = self._run_dmrg(
+                mpo,
+                root_config,
+                root_tag,
+                initial_mps_tag=anchor_tag,
+                initial_determinants=(
+                    None if anchor_tag is not None else target_determinants
+                ),
+                projected_mps_tags=previous_tags,
+                projection_weight=max(10.0, float(penalty)),
+            )
+            ket = self.get_mps(root_tag)
             expectations = self.symmetry_expectations(parity_matrix, ket=ket)
             if not np.allclose(expectations, targets, atol=verify_tol):
-                logger.warning(
-                    "sector %s root %d not clean: <S_k> = %s (targets %s)",
-                    sector_label, iroot, expectations, targets,
+                raise RuntimeError(
+                    f"sector {sector_label} root {iroot} targeting failed: "
+                    f"<S_k>={expectations}, targets={targets}, penalty={penalty}"
                 )
             bare = self.energy_expectation(ket)
             results.append((bare, root_tag))
+            previous_tags.append(root_tag)
             self._record_run(DMRGResult(
                 energy=bare,
                 mps_tag=root_tag,
                 store_dir=str(self.store_dir),
-                config=config,
-                elapsed_seconds=elapsed / max(nroots, 1),
+                config=root_config,
+                elapsed_seconds=elapsed,
                 sector_label=sector_label,
                 symmetry_expectations=tuple(float(x) for x in expectations),
             ))
@@ -1071,6 +1255,20 @@ class Block2DMRGSolver:
     def energy_expectation(self, ket=None) -> float:
         """``<ket|H|ket>`` for a stored or supplied MPS."""
         return self.expectation(self.hamiltonian_mpo(), ket=ket)
+
+    def spin_resolved_rdms(self, ket=None) -> tuple[np.ndarray, np.ndarray]:
+        """Return conventional spin-resolved 1- and 2-particle RDMs.
+
+        The returned arrays follow the Block2 SZ conventions documented by
+        ``DMRGDriver.get_conventional_npdm``.  The first axes contain
+        ``(alpha, beta)`` for the 1-RDM and ``(aa, ab, bb)`` for the 2-RDM.
+        """
+        if ket is None:
+            ket = self.get_mps()
+        self._activate()
+        rdm1 = self.driver.get_conventional_1pdm(ket, iprint=0)
+        rdm2 = self.driver.get_conventional_2pdm(ket, iprint=0)
+        return np.asarray(rdm1), np.asarray(rdm2)
 
     def symmetry_expectations(
         self, parity_matrix: np.ndarray, ket=None

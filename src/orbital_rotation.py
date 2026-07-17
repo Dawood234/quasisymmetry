@@ -66,6 +66,54 @@ def params_to_U(
     return scipy.linalg.expm(generator)
 
 
+def parameter_generator(
+    x: np.ndarray,
+    norb: int,
+    pairs: PairList | None = None,
+) -> np.ndarray:
+    """Return the skew-symmetric matrix ``A(x)`` used in ``U = exp(A)``."""
+    x = np.asarray(x, dtype=float).ravel()
+    selected_pairs = full_pairs(norb) if pairs is None else pairs
+    if x.size != len(selected_pairs):
+        raise ValueError(
+            f"rotation parameter length {x.size} does not match packing "
+            f"size {len(selected_pairs)} (norb={norb}, "
+            f"restricted={pairs is not None})"
+        )
+    generator = np.zeros((norb, norb), dtype=float)
+    for value, (i, j) in zip(x, selected_pairs):
+        generator[i, j] = value
+        generator[j, i] = -value
+    return generator
+
+
+def rotation_and_derivatives(
+    x: np.ndarray,
+    norb: int,
+    pairs: PairList | None = None,
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Return ``U = exp(A(x))`` and every exact derivative ``dU/dx_k``.
+
+    The Frechet derivative accounts for the noncommutativity of finite orbital
+    rotations.  Replacing it by ``E_k U`` is correct only at special points.
+    """
+    generator = parameter_generator(x, norb, pairs)
+    selected_pairs = full_pairs(norb) if pairs is None else pairs
+    rotation = scipy.linalg.expm(generator)
+    derivatives = []
+    for i, j in selected_pairs:
+        direction = np.zeros_like(generator)
+        direction[i, j] = 1.0
+        direction[j, i] = -1.0
+        derivative = scipy.linalg.expm_frechet(
+            generator,
+            direction,
+            compute_expm=False,
+        )
+        derivatives.append(np.asarray(derivative, dtype=float))
+    return rotation, derivatives
+
+
 def load_orbital_irreps(molpath: str | Path) -> np.ndarray | None:
     """Load per-orbital irrep labels from a symmetry-adapted ``.chk`` or FCIDUMP.
 
