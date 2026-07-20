@@ -3,13 +3,21 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
+#SBATCH --mem=64G
 #SBATCH --time=24:00:00
 #SBATCH --output=/scratch/%u/las_h2o_631g_%j.out
 #SBATCH --export=ALL
 
 set -euo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Slurm copies the submitted script to a node-local spool directory.  Use the
+# submission directory, rather than BASH_SOURCE, to find the checkout.
+PROJECT_DIR="${LAS_PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}"
+PROJECT_DIR="$(cd "${PROJECT_DIR}" && pwd)"
+if [[ ! -f "${PROJECT_DIR}/run_h2o_631g_las.py" ]]; then
+    echo "LAS project directory does not contain run_h2o_631g_las.py: ${PROJECT_DIR}" >&2
+    exit 2
+fi
 # Set LAS_RUN_DIR when resubmitting after a walltime interruption.  Otherwise
 # every new Slurm allocation gets its own provenance-preserving output folder.
 SCRATCH_ROOT="${SCRATCH:-${HOME}/scratch}"
@@ -36,7 +44,7 @@ echo "Started: $(date --iso-8601=seconds)"
 echo "Project: ${PROJECT_DIR}"
 echo "Scratch root: ${SCRATCH_ROOT}"
 echo "Run directory: ${RUN_DIR}"
-echo "Restart command: LAS_RUN_DIR=${RUN_DIR} sbatch ${BASH_SOURCE[0]}"
+echo "Restart command: LAS_PROJECT_DIR=${PROJECT_DIR} LAS_RUN_DIR=${RUN_DIR} sbatch ${PROJECT_DIR}/submit_h2o_631g_las.sh"
 echo "Python: $(command -v python)"
 python --version
 

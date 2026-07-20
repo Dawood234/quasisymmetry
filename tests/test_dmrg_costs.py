@@ -14,7 +14,12 @@ import openfermion as of
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.dmrg_costs import DMRGOrbitalCosts, MultiplyConfig
+from src.dmrg_costs import (
+    DMRGOrbitalCosts,
+    MultiplyConfig,
+    _copy_mps_store_for_tag,
+    candidate_index_chunks,
+)
 from src.dmrg_solver import (
     Block2DMRGSolver,
     DMRGConfig,
@@ -25,6 +30,43 @@ from src.dmrg_solver import (
 FCIDUMP_PATH = (
     Path(__file__).resolve().parents[1] / "hamiltonians" / "sentest_5_d754.FCIDUMP"
 )
+
+
+class TestCandidateWorkerUtilities(unittest.TestCase):
+    def test_candidate_chunks_are_balanced_and_complete(self):
+        chunks = candidate_index_chunks(91, 4)
+        self.assertEqual([len(chunk) for chunk in chunks], [23, 23, 23, 22])
+        flattened = [item for chunk in chunks for item in chunk]
+        self.assertEqual(flattened, list(range(91)))
+
+    def test_candidate_chunks_do_not_create_empty_workers(self):
+        chunks = candidate_index_chunks(3, 8)
+        self.assertEqual(chunks, [[0], [1], [2]])
+
+    def test_worker_store_copy_excludes_old_intermediates(self):
+        root = Path(tempfile.mkdtemp(prefix="dmrg_store_copy_"))
+        try:
+            source = root / "source"
+            target = root / "target"
+            source.mkdir()
+            keep = [
+                "integrals.npz",
+                "metadata.json",
+                "GS-mps_info.bin",
+                "F.MPS.GS.0",
+                "F.MPS.INFO.GS.LEFT.0",
+            ]
+            for name in keep:
+                (source / name).write_text(name, encoding="utf-8")
+            (source / "F.MPS.SCORE_PHI_1.0").write_text("old", encoding="utf-8")
+
+            copied = _copy_mps_store_for_tag(source, target, "GS")
+
+            self.assertEqual(copied, len(keep))
+            copied_names = sorted(path.name for path in target.iterdir())
+            self.assertEqual(copied_names, sorted(keep))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 def build_h_sparse(solver: Block2DMRGSolver):

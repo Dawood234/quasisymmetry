@@ -210,6 +210,8 @@ def selection_command(args, checkpoint, rotation, cycle_dir, parent_store):
         str(args.reference_sweeps),
         "--n_threads",
         str(args.cpus),
+        "--candidate_workers",
+        str(args.candidate_workers),
         "--multiply_sweeps",
         str(args.multiply_sweeps),
         "--parity_output",
@@ -358,10 +360,16 @@ def parse_args():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--cpus", type=int, default=32)
+    parser.add_argument(
+        "--candidate_workers",
+        type=int,
+        default=4,
+        help="processes used to score independent NC candidates",
+    )
     parser.add_argument("--target_rank", type=int, default=7)
     parser.add_argument("--max_macrocycles", type=int, default=3)
-    parser.add_argument("--reference_bond_dim", type=int, default=500)
-    parser.add_argument("--reference_sweeps", type=int, default=20)
+    parser.add_argument("--reference_bond_dim", type=int, default=150)
+    parser.add_argument("--reference_sweeps", type=int, default=8)
     parser.add_argument("--sector_bond_dim", type=int, default=100)
     parser.add_argument("--sector_sweeps", type=int, default=6)
     parser.add_argument("--sector_penalty", type=float, default=30.0)
@@ -374,8 +382,8 @@ def parse_args():
     parser.add_argument("--sector_switch_maxiter", type=int, default=2)
     parser.add_argument("--min_dominant_sectors", type=int, default=8)
     parser.add_argument("--max_dominant_sectors", type=int, default=16)
-    parser.add_argument("--multiply_bond_dim", type=int, default=None)
-    parser.add_argument("--multiply_sweeps", type=int, default=8)
+    parser.add_argument("--multiply_bond_dim", type=int, default=150)
+    parser.add_argument("--multiply_sweeps", type=int, default=4)
     parser.add_argument("--final_bond_dims", default="350,500")
     parser.add_argument("--final_sweeps", type=int, default=20)
     parser.add_argument("--roots_per_sector", type=int, default=5)
@@ -395,6 +403,7 @@ def main():
         args.max_macrocycles = 1
         args.final_bond_dims = "35,50"
         args.final_sweeps = 2
+        args.multiply_bond_dim = 50
         args.multiply_sweeps = 2
 
     job_id = os.environ.get("SLURM_JOB_ID", time.strftime("%Y%m%d_%H%M%S"))

@@ -44,6 +44,7 @@ def run_dmrg_senquart_selection(args):
         MultiplyConfig,
         build_dmrg_orbital_costs,
         commutator_scores_by_row,
+        parallel_commutator_scores_from_store,
         parity_expectations_by_row,
     )
     from src.dmrg_solver import DMRGConfig
@@ -80,6 +81,10 @@ def run_dmrg_senquart_selection(args):
 
     candidates = seniority_quartet_candidates(norb)
     rows = candidate_matrix(candidates)
+    args.candidate_workers = max(
+        1,
+        min(int(args.candidate_workers), int(args.n_threads), len(rows)),
+    )
     pairs, irreps = resolve_orbital_rotation(
         args.orbital_rotation, str(molpath), norb
     )
@@ -92,6 +97,10 @@ def run_dmrg_senquart_selection(args):
     )
     x = np.atleast_1d(np.asarray(x, dtype=float))
 
+    multiply = MultiplyConfig(
+        bond_dim=args.multiply_bond_dim,
+        n_sweeps=args.multiply_sweeps,
+    )
     costs, reference, _ = build_dmrg_orbital_costs(
         str(molpath),
         rows,
@@ -100,15 +109,29 @@ def run_dmrg_senquart_selection(args):
             max_bond_dim=args.bond_dim,
             n_sweeps=args.n_sweeps,
         ),
-        multiply=MultiplyConfig(
-            bond_dim=args.multiply_bond_dim,
-            n_sweeps=args.multiply_sweeps,
-        ),
+        multiply=multiply,
         reuse=not args.no_reuse,
         n_threads=args.n_threads,
         pairs=pairs,
     )
-    scores = commutator_scores_by_row(costs, x)
+    score_start = time.perf_counter()
+    if args.candidate_workers > 1:
+        selection_path = args.selection_output or args.symmetry_manifest
+        worker_scratch = Path(selection_path).resolve().parent
+        scores = parallel_commutator_scores_from_store(
+            reference.store_dir,
+            rows,
+            x,
+            pairs=pairs,
+            multiply=multiply,
+            n_threads=args.n_threads,
+            n_workers=args.candidate_workers,
+            scratch_root=worker_scratch,
+            mps_tag=reference.mps_tag,
+        )
+    else:
+        scores = commutator_scores_by_row(costs, x)
+    score_seconds = time.perf_counter() - score_start
     scored = assign_candidate_scores(candidates, scores)
     selected = select_independent_candidates(scored, args.target_rank)
     parity_matrix = selected_parity_matrix(selected)
@@ -138,6 +161,11 @@ def run_dmrg_senquart_selection(args):
         "orbital_rotation": args.orbital_rotation,
         "irreps": None if irreps is None else np.asarray(irreps, dtype=int).tolist(),
         "mps_store": str(reference.store_dir),
+        "candidate_workers": int(args.candidate_workers),
+        "candidate_worker_threads": max(
+            1, int(args.n_threads) // max(1, int(args.candidate_workers))
+        ),
+        "candidate_scoring_seconds": float(score_seconds),
     }
     save_symmetry_manifest(
         args.symmetry_manifest, symmetries, spin_matrix, metadata=metadata
@@ -165,6 +193,7 @@ def run_dmrg_senquart_selection(args):
 
     print("DMRG reference energy:", reference.energy)
     print("candidate count:", len(candidates))
+    print("candidate scoring seconds:", score_seconds)
     print("selected GF(2) rank:", args.target_rank)
     for item in selected:
         print(item["label"], item["score"])
@@ -215,6 +244,15 @@ if __name__=="__main__":
     parser.add_argument("--bond_dim", type=int, default=500)
     parser.add_argument("--n_sweeps", type=int, default=20)
     parser.add_argument("--n_threads", type=int, default=4)
+    parser.add_argument(
+        "--candidate_workers",
+        type=int,
+        default=1,
+        help=(
+            "parallel processes for independent DMRG candidate scores; "
+            "the total --n_threads budget is divided among them"
+        ),
+    )
     parser.add_argument("--multiply_bond_dim", type=int, default=None)
     parser.add_argument("--multiply_sweeps", type=int, default=8)
     parser.add_argument("--no_reuse", action="store_true")

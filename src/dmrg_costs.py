@@ -22,8 +22,14 @@ unchanged.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
+import multiprocessing
+import os
+import shutil
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Sequence
 
 import numpy as np
@@ -143,9 +149,10 @@ class DMRGOrbitalCosts:
     def _ensure_eta(self) -> None:
         if self._eta is None:
             logger.info("caching H|psi> for MPS-native costs")
+            eta_bond_dim = self.multiply.bond_dim or self._ref_bond_dim
             self._eta = self._apply(
                 self._h_mpo, self.ket, "ETA",
-                bond_dim=self._bra_bond_dim(self._ref_bond_dim),
+                bond_dim=self._bra_bond_dim(eta_bond_dim),
             )
 
     # ------------------------------------------------------------------
@@ -252,7 +259,13 @@ def build_dmrg_orbital_costs(
     return costs, result, solver
 
 
-def commutator_scores_by_row(costs, x):
+def commutator_scores_by_row(
+    costs,
+    x,
+    candidate_numbers=None,
+    total_candidates=None,
+    worker_label=None,
+):
     """Return one MPS-native NC score for every parity row.
 
     This is the per-generator form of :meth:`DMRGOrbitalCosts.commutator`.
@@ -267,8 +280,19 @@ def commutator_scores_by_row(costs, x):
     scores = []
 
     total_rows = len(costs.parity_matrix)
-    for index, row in enumerate(costs.parity_matrix, start=1):
-        print(f"[NC score] candidate {index}/{total_rows}", flush=True)
+    if candidate_numbers is None:
+        candidate_numbers = list(range(1, total_rows + 1))
+    if total_candidates is None:
+        total_candidates = total_rows
+
+    for local_index, row in enumerate(costs.parity_matrix):
+        candidate_number = int(candidate_numbers[local_index])
+        prefix = f"[{worker_label}] " if worker_label else ""
+        print(
+            f"[NC score] {prefix}candidate "
+            f"{candidate_number}/{int(total_candidates)}",
+            flush=True,
+        )
         phi = costs._apply_symmetry(row, rotation, costs.ket, "SCORE_PHI")
         xi = costs._apply_symmetry(row, rotation, costs._eta, "SCORE_XI")
         chi = costs._apply(costs._h_mpo, phi, "SCORE_CHI")
@@ -279,6 +303,181 @@ def commutator_scores_by_row(costs, x):
         scores.append(max(0.0, float(score)))
 
     return np.asarray(scores, dtype=float)
+
+
+def candidate_index_chunks(n_candidates, n_workers):
+    """Split candidate indices into balanced, nonempty worker chunks."""
+    n_candidates = int(n_candidates)
+    n_workers = max(1, min(int(n_workers), n_candidates))
+    indices = np.arange(n_candidates, dtype=int)
+    chunks = np.array_split(indices, n_workers)
+    return [chunk.tolist() for chunk in chunks if len(chunk)]
+
+
+def _score_candidate_chunk(task):
+    """Load one private MPS store and score one candidate chunk."""
+    worker_number = int(task["worker_number"])
+    worker_threads = int(task["worker_threads"])
+    os.environ["OMP_NUM_THREADS"] = str(worker_threads)
+    os.environ["MKL_NUM_THREADS"] = str(worker_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(worker_threads)
+
+    solver = Block2DMRGSolver.load(
+        task["store_dir"],
+        n_threads=worker_threads,
+    )
+    costs = DMRGOrbitalCosts(
+        solver,
+        np.asarray(task["rows"], dtype=int),
+        mps_tag=task["mps_tag"],
+        multiply=MultiplyConfig(
+            bond_dim=task["multiply_bond_dim"],
+            n_sweeps=int(task["multiply_sweeps"]),
+            tol=float(task["multiply_tol"]),
+            bra_bond_dim_factor=float(task["bra_bond_dim_factor"]),
+        ),
+        pairs=task["pairs"],
+    )
+    indices = [int(index) for index in task["indices"]]
+    scores = commutator_scores_by_row(
+        costs,
+        np.asarray(task["x"], dtype=float),
+        candidate_numbers=[index + 1 for index in indices],
+        total_candidates=int(task["total_candidates"]),
+        worker_label=f"worker {worker_number}",
+    )
+    return indices, scores.tolist()
+
+
+def _copy_mps_store_for_tag(source_dir, target_dir, mps_tag):
+    """Copy only one saved MPS and the integrals needed to reload it."""
+    source_dir = Path(source_dir)
+    target_dir = Path(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    exact_names = {
+        "integrals.npz",
+        "metadata.json",
+        f"{mps_tag}-mps_info.bin",
+    }
+    mps_prefix = f"F.MPS.{mps_tag}."
+    info_prefix = f"F.MPS.INFO.{mps_tag}."
+    copied = 0
+    for source in source_dir.iterdir():
+        if not source.is_file():
+            continue
+        if (
+            source.name in exact_names
+            or source.name.startswith(mps_prefix)
+            or source.name.startswith(info_prefix)
+        ):
+            shutil.copy2(source, target_dir / source.name)
+            copied += 1
+    if not (target_dir / f"{mps_tag}-mps_info.bin").exists():
+        raise FileNotFoundError(
+            f"MPS tag {mps_tag!r} was not found in {source_dir}"
+        )
+    return copied
+
+
+def parallel_commutator_scores_from_store(
+    store_dir,
+    parity_matrix,
+    x,
+    pairs=None,
+    multiply=None,
+    n_threads=1,
+    n_workers=1,
+    scratch_root=None,
+    mps_tag="GS",
+):
+    """Score parity rows in separate Block2 worker processes.
+
+    Each process receives a private copy of the parent MPS store.  Block2 uses
+    files inside that store for temporary MPS tensors, so sharing one directory
+    among concurrent workers can corrupt intermediate states.
+    """
+    rows = np.atleast_2d(np.asarray(parity_matrix, dtype=int))
+    chunks = candidate_index_chunks(len(rows), n_workers)
+    if len(chunks) == 1:
+        solver = Block2DMRGSolver.load(store_dir, n_threads=int(n_threads))
+        costs = DMRGOrbitalCosts(
+            solver,
+            rows,
+            mps_tag=mps_tag,
+            multiply=multiply,
+            pairs=pairs,
+        )
+        return commutator_scores_by_row(costs, x)
+
+    multiply = multiply or MultiplyConfig()
+    worker_threads = max(1, int(n_threads) // len(chunks))
+    scratch_parent = Path(scratch_root or Path(store_dir).parent)
+    scratch_parent.mkdir(parents=True, exist_ok=True)
+    worker_root = Path(
+        tempfile.mkdtemp(prefix="nc_candidate_workers_", dir=scratch_parent)
+    )
+
+    print(
+        f"[NC score] parallel workers={len(chunks)}, "
+        f"threads_per_worker={worker_threads}",
+        flush=True,
+    )
+    tasks = []
+    try:
+        for worker_number, indices in enumerate(chunks, start=1):
+            worker_store = worker_root / f"worker_{worker_number}" / "mps"
+            print(
+                f"[NC score] preparing worker {worker_number}/{len(chunks)} "
+                f"with {len(indices)} candidates",
+                flush=True,
+            )
+            copied = _copy_mps_store_for_tag(store_dir, worker_store, mps_tag)
+            print(
+                f"[NC score] worker {worker_number} copied "
+                f"{copied} parent-MPS files",
+                flush=True,
+            )
+            tasks.append(
+                {
+                    "worker_number": worker_number,
+                    "worker_threads": worker_threads,
+                    "store_dir": str(worker_store),
+                    "rows": rows[indices].tolist(),
+                    "indices": indices,
+                    "total_candidates": len(rows),
+                    "x": np.asarray(x, dtype=float).tolist(),
+                    "pairs": None if pairs is None else list(pairs),
+                    "mps_tag": str(mps_tag),
+                    "multiply_bond_dim": multiply.bond_dim,
+                    "multiply_sweeps": multiply.n_sweeps,
+                    "multiply_tol": multiply.tol,
+                    "bra_bond_dim_factor": multiply.bra_bond_dim_factor,
+                }
+            )
+
+        scores = np.empty(len(rows), dtype=float)
+        context = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=len(tasks),
+            mp_context=context,
+        ) as executor:
+            futures = [
+                executor.submit(_score_candidate_chunk, task)
+                for task in tasks
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                indices, chunk_scores = future.result()
+                scores[np.asarray(indices, dtype=int)] = np.asarray(
+                    chunk_scores, dtype=float
+                )
+                print(
+                    f"[NC score] completed {len(indices)} candidates; "
+                    f"first candidate={indices[0] + 1}",
+                    flush=True,
+                )
+        return scores
+    finally:
+        shutil.rmtree(worker_root, ignore_errors=True)
 
 
 def parity_expectations_by_row(costs, x, parity_matrix):
