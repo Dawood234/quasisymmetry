@@ -11,8 +11,6 @@ import numpy as np
 import scipy
 import scipy.sparse.linalg
 from tqdm import tqdm
-from mpi4py import MPI
-from mpi4py.futures import MPIPoolExecutor
 
 from chemistry import CHEMICAL_PRECISION, fcidump_data, load_moldata
 from optimize_symmetries import (
@@ -58,6 +56,18 @@ from src.clifford_sectors import (
 
 # Used by MPI worker processes (must be importable at module level).
 import ffsim
+
+
+def mpi_tools():
+    """Return MPI helpers only for metric paths that run MPI workers."""
+    try:
+        from mpi4py import MPI
+        from mpi4py.futures import MPIPoolExecutor
+    except ImportError as error:
+        raise RuntimeError(
+            "mpi4py is required for parallel FCI/Davidson or tapered-LCU metrics."
+        ) from error
+    return MPI, MPIPoolExecutor
 
 
 def submatrix_eigenvalues_to_target(A: np.ndarray, e_target: float):
@@ -361,6 +371,7 @@ def solve_clifford_sectors(frame, physical_sectors, labels, n_roots, parallel):
     ]
     results = {}
     if parallel:
+        _, MPIPoolExecutor = mpi_tools()
         with MPIPoolExecutor() as executor:
             iterator = executor.map(solve_tapered_task, tasks)
             for result in iterator:
@@ -429,6 +440,7 @@ def build_coupled_block_cache(frame, sector_results, candidates, parallel):
             )
 
     if parallel and tasks:
+        _, MPIPoolExecutor = mpi_tools()
         with MPIPoolExecutor() as executor:
             for result in executor.map(build_tapered_block_task, tasks):
                 cache[result["key"]] = result["matrix"]
@@ -924,6 +936,7 @@ if __name__ == "__main__":
 
     print("qty of sectors ", len(sectors.keys()))
 
+    MPI, MPIPoolExecutor = mpi_tools()
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
