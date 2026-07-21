@@ -33,6 +33,8 @@ if [[ ! -x "${LAS_VENV}/bin/python" ]]; then
     exit 2
 fi
 
+# Use the cluster MPI stack that provides mpi4py for metrics.py.
+module load openmpi mpi4py
 source "${LAS_VENV}/bin/activate"
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
@@ -50,6 +52,7 @@ python --version
 
 python - <<'PY'
 import ffsim
+from mpi4py import MPI
 import numpy
 import openfermion
 import pyscf
