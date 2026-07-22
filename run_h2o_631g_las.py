@@ -297,15 +297,18 @@ def write_summary(run_dir, state, metadata, reference_results, metrics):
     (low_bond, e_low), (high_bond, e_high) = reference_results
     difference_mha = abs(e_high - e_low) * 1000.0
     reference_converged = difference_mha <= 0.2
+    metric_reference = metrics.get("E_reference", metrics.get("E_FCI"))
+    if metric_reference is None:
+        raise ValueError("final metrics contain no reference energy")
     decoupled_error_mha = (
         None
         if metrics.get("E_decoupled") is None
-        else (float(metrics["E_decoupled"]) - float(metrics["E_FCI"])) * 1000.0
+        else (float(metrics["E_decoupled"]) - float(metric_reference)) * 1000.0
     )
     coupled_error_mha = (
         None
         if metrics.get("E_coupled") is None
-        else (float(metrics["E_coupled"]) - float(metrics["E_FCI"])) * 1000.0
+        else (float(metrics["E_coupled"]) - float(metric_reference)) * 1000.0
     )
     chemical_accuracy = (
         reference_converged
@@ -321,6 +324,8 @@ def write_summary(run_dir, state, metadata, reference_results, metrics):
             f"M{low_bond}": e_low,
             f"M{high_bond}": e_high,
         },
+        "final_metrics_reference": float(metric_reference),
+        "final_metrics_reference_method": metrics.get("reference_method", "FCI"),
         "reference_difference_mHa": difference_mha,
         "reference_converged_0.2_mHa": reference_converged,
         "decoupled_error_mHa": decoupled_error_mha,
@@ -608,36 +613,39 @@ def main():
         )
         reference_results.append((bond, store, result_file))
 
-    final_bond, final_store, _ = reference_results[-1]
+    _, _, final_reference_result = reference_results[-1]
     metrics_json = run_dir / "final_metrics.json"
+    selected_work_dir = run_dir / "final_selected_clifford_lanczos"
+    print(
+        "\nFinal projected evaluation uses selected Clifford sectors and "
+        "matrix-free Lanczos.",
+        flush=True,
+    )
+    print(
+        "It will not build the complete fixed-spin Hamiltonian matrix and "
+        "will checkpoint every completed sector.",
+        flush=True,
+    )
     run_stage(
         state_path,
         state,
-        "07_final_projected_metrics",
+        "07_final_selected_clifford_lanczos",
         [
             sys.executable,
             "-u",
-            str(PROJECT_DIR / "metrics.py"),
+            str(PROJECT_DIR / "selected_clifford_lanczos.py"),
             str(final_oo),
-            "--backend",
-            "dmrg",
-            "--bond_dim",
-            str(final_bond),
-            "--dmrg_sweeps",
-            str(args.final_sweeps),
-            "--penalty",
-            str(args.sector_penalty),
+            "--reference_result",
+            str(final_reference_result),
+            "--work_dir",
+            str(selected_work_dir),
             "--max_sectors",
             str(args.max_dominant_sectors),
-            "--states_per_sector",
+            "--roots_per_sector",
             str(args.roots_per_sector),
-            "--n_threads",
-            str(args.cpus),
-            "--wavefunction_dir",
-            str(final_store),
             "--outname",
             str(metrics_json),
-        ],
+        ] + (["--resume"] if args.resume else []),
         [metrics_json],
         args.resume,
     )

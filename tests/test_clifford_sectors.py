@@ -23,6 +23,11 @@ from src.clifford_sectors import (
     z_symmetries_from_parity_matrix,
 )
 from src.sector_utils import subspace_matrix, symmetry_sectors
+from src.selected_sector_lanczos import (
+    coupled_candidate_matrix,
+    selected_sector_supports,
+    solve_selected_sector,
+)
 
 
 def test_diagonal_and_off_diagonal_tapering_matches_explicit_blocks():
@@ -184,6 +189,71 @@ def test_fixed_particle_basis_mapping_matches_clifford_state_action():
     state[bits_to_index(bits)] = 1.0
     transformed = signed_frame["clifford"].transform_state(state)
     assert int(np.argmax(np.abs(transformed))) == bits_to_index(expected_bits)
+
+
+def test_selected_support_generation_matches_full_sector_grouping():
+    parity_matrix = np.asarray([[1, 0], [0, 1]], dtype=int)
+    symmetries = z_symmetries_from_parity_matrix(parity_matrix, 2)
+    frame = build_clifford_frame(of.QubitOperator(), symmetries, 4)
+    full = symmetry_sectors(parity_matrix, 2, (1, 1))
+    labels = sorted(full)[:3]
+    selected = selected_sector_supports(
+        parity_matrix,
+        labels,
+        2,
+        (1, 1),
+        frame["clifford"],
+        frame["n_symmetries"],
+        print_progress=False,
+    )
+    for label in labels:
+        assert set(selected[label]["full_addresses"]) == set(full[label])
+        assert selected[label]["dimension"] == len(full[label])
+
+
+def test_selected_lanczos_and_coupled_matrix_match_full_operator():
+    import ffsim
+
+    path = "hamiltonians/water/H2O_OH0.9580_104.5000.FCIDUMP"
+    parity_matrix = np.asarray([[1, 0, 0, 0, 0, 0, 0]], dtype=int)
+    moldata = load_moldata(path)
+    symmetries = z_symmetries_from_parity_matrix(parity_matrix, moldata.norb)
+    frame = build_clifford_frame(of.QubitOperator(), symmetries, 2 * moldata.norb)
+    labels = [(0,), (1,)]
+    supports = selected_sector_supports(
+        parity_matrix,
+        labels,
+        moldata.norb,
+        moldata.nelec,
+        frame["clifford"],
+        frame["n_symmetries"],
+        print_progress=False,
+    )
+    full_operator = ffsim.linear_operator(
+        moldata.hamiltonian, norb=moldata.norb, nelec=moldata.nelec
+    )
+    results = {}
+    for label in labels:
+        solved = solve_selected_sector(
+            full_operator,
+            full_operator.shape[0],
+            supports[label]["full_addresses"],
+            2,
+            tolerance=1e-10,
+            print_every=0,
+        )
+        direct = np.linalg.eigvalsh(
+            subspace_matrix(full_operator, supports[label]["full_addresses"])
+        )[:2]
+        assert np.allclose(solved["energies"], direct, atol=1e-9)
+        results[label] = {**supports[label], **solved}
+
+    coupled, candidates, _ = coupled_candidate_matrix(
+        full_operator, full_operator.shape[0], results
+    )
+    assert coupled.shape == (4, 4)
+    assert len(candidates) == 4
+    assert np.allclose(coupled, coupled.conj().T, atol=1e-10)
 
 
 def test_h2o_tapered_sectors_match_determinant_blocks_and_full_fci():
