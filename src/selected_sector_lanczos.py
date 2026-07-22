@@ -34,6 +34,15 @@ def parity_spin_blocks(parity_matrix, norb):
     raise ValueError("parity matrix must have norb or 2*norb columns")
 
 
+def spin_orbital_parity_matrix(parity_matrix, norb):
+    """Return parity rows in interleaved alpha/beta spin-orbital form."""
+    alpha_rows, beta_rows = parity_spin_blocks(parity_matrix, norb)
+    expanded = np.zeros((alpha_rows.shape[0], 2 * norb), dtype=np.uint8)
+    expanded[:, 0::2] = alpha_rows
+    expanded[:, 1::2] = beta_rows
+    return expanded
+
+
 def bitstring_syndrome(bitstring, columns):
     """Evaluate GF(2) parity rows on one spatial-orbital bitstring."""
     syndrome = np.zeros(columns.shape[0], dtype=np.uint8)

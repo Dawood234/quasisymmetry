@@ -27,6 +27,7 @@ from src.selected_sector_lanczos import (
     coupled_candidate_matrix,
     selected_sector_supports,
     solve_selected_sector,
+    spin_orbital_parity_matrix,
 )
 
 
@@ -209,6 +210,17 @@ def test_selected_support_generation_matches_full_sector_grouping():
     for label in labels:
         assert set(selected[label]["full_addresses"]) == set(full[label])
         assert selected[label]["dimension"] == len(full[label])
+
+
+def test_spatial_and_spin_orbital_parity_rows_normalize_identically():
+    spatial = np.asarray([[1, 0, 1], [0, 1, 1]], dtype=int)
+    spin = np.zeros((2, 6), dtype=int)
+    spin[:, 0::2] = spatial
+    spin[:, 1::2] = spatial
+    assert np.array_equal(
+        spin_orbital_parity_matrix(spatial, 3),
+        spin_orbital_parity_matrix(spin, 3),
+    )
 
 
 def test_selected_lanczos_and_coupled_matrix_match_full_operator():

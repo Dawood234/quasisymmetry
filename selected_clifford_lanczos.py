@@ -34,6 +34,7 @@ from src.selected_sector_lanczos import (
     label_text,
     selected_sector_supports,
     solve_selected_sector,
+    spin_orbital_parity_matrix,
 )
 
 
@@ -246,7 +247,11 @@ def main():
     if manifest_path:
         manifest = load_symmetry_manifest(manifest_path)
         symmetries = manifest["symmetries"]
-        if not np.array_equal(manifest["parity_matrix"] % 2, parity_matrix % 2):
+        manifest_rows = spin_orbital_parity_matrix(
+            manifest["parity_matrix"], moldata.norb
+        )
+        parity_rows = spin_orbital_parity_matrix(parity_matrix, moldata.norb)
+        if not np.array_equal(manifest_rows, parity_rows):
             raise ValueError("symmetry manifest and parity file contain different rows")
     else:
         symmetries = z_symmetries_from_parity_matrix(parity_matrix, moldata.norb)
