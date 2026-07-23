@@ -14,6 +14,7 @@ from src.coupled_energy_core import (
     all_sector_eigenpair_candidates,
     build_candidate_hamiltonian,
     find_k_epsilon,
+    iterative_pt_from_hamiltonian,
     k_pt_from_ordered_weights,
     nested_ground_energy,
     one_shot_coupled_energy,
@@ -163,6 +164,28 @@ class CoupledEnergySanityTests(unittest.TestCase):
         self.assertGreaterEqual(result.K, 2)
         self.assertAlmostEqual(result.e_coupled, e_exact, places=10)
         self.assertEqual(len(result.chosen_keys), result.K)
+
+    def test_iterative_pt_updates_couplings_to_current_state(self):
+        matrix = np.asarray(
+            [
+                [0.0, 0.10, 0.00],
+                [0.10, 0.30, 0.08],
+                [0.00, 0.08, 0.35],
+            ]
+        )
+        exact = float(np.linalg.eigvalsh(matrix)[0])
+
+        result = iterative_pt_from_hamiltonian(
+            matrix,
+            e_exact=exact,
+            tol=1.0e-12,
+            batch_size=1,
+        )
+
+        self.assertTrue(result.converged)
+        self.assertEqual(result.K, 3)
+        self.assertAlmostEqual(result.e_coupled, exact, places=12)
+        self.assertEqual(result.order_indices, [0, 1, 2])
 
     def test_build_candidate_hamiltonian_matches_projection(self):
         h, _sectors, sector_data, _e_exact = _toy_hamiltonian_and_sectors()

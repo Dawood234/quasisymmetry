@@ -365,6 +365,89 @@ def one_shot_from_hamiltonian(
     )
 
 
+def iterative_pt_from_hamiltonian(
+    h_coupled: np.ndarray,
+    *,
+    e_exact: float | None = None,
+    tol: float = CHEMICAL_PRECISION,
+    tau_pt: float = DEFAULT_TAU_PT,
+    batch_size: int = 1,
+    keys: Sequence[tuple[object, int]] | None = None,
+    max_total_vectors: int | None = None,
+) -> CoupledDimensionResult:
+    """Grow ``K`` by PT couplings to the current coupled ground state."""
+    matrix = np.asarray(h_coupled)
+    count = matrix.shape[0]
+    if count == 0:
+        return CoupledDimensionResult(
+            e_coupled=None, K=None, converged=False, chosen_keys=[]
+        )
+    if matrix.shape != (count, count):
+        raise ValueError("h_coupled must be square")
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if keys is not None and len(keys) != count:
+        raise ValueError("keys must match Hamiltonian dimension")
+
+    limit = count if max_total_vectors is None else min(
+        count, max(1, int(max_total_vectors))
+    )
+    anchor = int(np.argmin(np.real(np.diag(matrix))))
+    active = [anchor]
+    remaining = set(range(count))
+    remaining.remove(anchor)
+    last_weights = np.zeros(count, dtype=float)
+
+    while True:
+        active_matrix = matrix[np.ix_(active, active)]
+        eigenvalues, eigenvectors = np.linalg.eigh(active_matrix)
+        energy = float(np.real(eigenvalues[0]))
+        coefficients = eigenvectors[:, 0]
+        if e_exact is not None and energy - float(e_exact) <= float(tol):
+            break
+        if not remaining or len(active) >= limit:
+            break
+
+        scored = []
+        last_weights[:] = 0.0
+        for candidate in remaining:
+            coupling = np.dot(matrix[candidate, active], coefficients)
+            denominator = float(np.real(matrix[candidate, candidate])) - energy
+            weight = one_shot_pt_weight(coupling, denominator)
+            last_weights[candidate] = weight
+            scored.append((weight, candidate))
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                float(np.real(matrix[item[1], item[1]])),
+                item[1],
+            )
+        )
+
+        selected = [
+            candidate for weight, candidate in scored
+            if weight >= float(tau_pt)
+        ][: int(batch_size)]
+        if not selected and scored:
+            selected = [scored[0][1]]
+        selected = selected[: limit - len(active)]
+        if not selected:
+            break
+        active.extend(selected)
+        remaining.difference_update(selected)
+
+    return coupled_dimension_from_order(
+        matrix,
+        active,
+        e_exact=e_exact,
+        tol=tol,
+        k_start=len(active),
+        keys=keys,
+        k_pt=len(active),
+        pt_weights=last_weights,
+    )
+
+
 def reference_from_hamiltonian(
     h_coupled: np.ndarray,
     reference_weights: Sequence[float],

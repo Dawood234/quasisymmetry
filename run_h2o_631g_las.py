@@ -397,6 +397,10 @@ def parse_args():
     parser.add_argument("--final_bond_dims", default="350,500")
     parser.add_argument("--final_sweeps", type=int, default=20)
     parser.add_argument("--roots_per_sector", type=int, default=5)
+    parser.add_argument("--max_roots_per_sector", type=int, default=20)
+    parser.add_argument("--root_batch_size", type=int, default=5)
+    parser.add_argument("--root_coupling_capture", type=float, default=0.90)
+    parser.add_argument("--pt_batch_size", type=int, default=4)
     return parser.parse_args()
 
 
@@ -663,6 +667,14 @@ def main():
             str(args.max_dominant_sectors),
             "--roots_per_sector",
             str(args.roots_per_sector),
+            "--max_roots_per_sector",
+            str(args.max_roots_per_sector),
+            "--root_batch_size",
+            str(args.root_batch_size),
+            "--root_coupling_capture",
+            str(args.root_coupling_capture),
+            "--pt_batch_size",
+            str(args.pt_batch_size),
             "--outname",
             str(metrics_json),
         ] + (["--resume"] if args.resume else []),

@@ -27,11 +27,13 @@ from src.clifford_sectors import (
     tapered_operator,
     z_symmetries_from_parity_matrix,
 )
-from src.coupled_energy_core import one_shot_from_hamiltonian
+from src.coupled_energy_core import iterative_pt_from_hamiltonian
 from src.orbital_rotation import rotation_from_oo_data
 from src.selected_sector_lanczos import (
+    coupling_capture,
     coupled_candidate_matrix,
     label_text,
+    sector_leakage_weights,
     selected_sector_supports,
     solve_selected_sector,
     spin_orbital_parity_matrix,
@@ -118,8 +120,13 @@ def validate_anchor_energy(input_data, label, energy, tolerance):
         )
 
 
-def load_or_build_sector(path, support, full_operator, full_dimension, args):
+def load_or_build_sector(
+    path, support, full_operator, full_dimension, args, root_count=None
+):
     """Reload one completed sector or solve and checkpoint it."""
+    requested_roots = (
+        int(args.roots_per_sector) if root_count is None else int(root_count)
+    )
     path = Path(path)
     if args.resume and path.exists():
         saved = np.load(path, allow_pickle=False)
@@ -133,7 +140,7 @@ def load_or_build_sector(path, support, full_operator, full_dimension, args):
             energies = np.asarray(saved["energies"])
             vectors = np.asarray(saved["vectors"])
             if (
-                len(energies) >= args.roots_per_sector
+                len(energies) >= requested_roots
                 and saved_tolerance <= args.lanczos_tolerance
             ):
                 print(
@@ -143,8 +150,8 @@ def load_or_build_sector(path, support, full_operator, full_dimension, args):
                 )
                 return {
                     **support,
-                    "energies": energies[: args.roots_per_sector],
-                    "vectors": vectors[:, : args.roots_per_sector],
+                    "energies": energies[:requested_roots],
+                    "vectors": vectors[:, :requested_roots],
                     "solver": str(saved["solver"].item()),
                     "elapsed_seconds": float(saved["elapsed_seconds"].item()),
                     "matvec_count": int(saved["matvec_count"].item()),
@@ -154,7 +161,7 @@ def load_or_build_sector(path, support, full_operator, full_dimension, args):
 
     label = label_text(support["label"])
     print(
-        f"[sector {label}] START roots={args.roots_per_sector}, "
+        f"[sector {label}] START roots={requested_roots}, "
         f"dimension={support['dimension']:,}, tol={args.lanczos_tolerance:g}",
         flush=True,
     )
@@ -162,7 +169,7 @@ def load_or_build_sector(path, support, full_operator, full_dimension, args):
         full_operator,
         full_dimension,
         support["full_addresses"],
-        args.roots_per_sector,
+        requested_roots,
         tolerance=args.lanczos_tolerance,
         maxiter=args.lanczos_maxiter,
         print_every=args.print_every_matvec,
@@ -220,6 +227,21 @@ def parse_args():
     parser.add_argument("--outname", required=True)
     parser.add_argument("--max_sectors", type=int, default=16)
     parser.add_argument("--roots_per_sector", type=int, default=5)
+    parser.add_argument("--max_roots_per_sector", type=int, default=20)
+    parser.add_argument("--root_batch_size", type=int, default=5)
+    parser.add_argument(
+        "--root_coupling_capture",
+        type=float,
+        default=0.90,
+        help="target fraction of anchor coupling represented by sector roots",
+    )
+    parser.add_argument(
+        "--sector_selection",
+        choices=("leakage", "mps"),
+        default="leakage",
+        help="rank sectors by anchor leakage or saved parent-MPS weight",
+    )
+    parser.add_argument("--pt_batch_size", type=int, default=4)
     parser.add_argument("--lanczos_tolerance", type=float, default=1e-9)
     parser.add_argument("--lanczos_maxiter", type=int, default=None)
     parser.add_argument("--print_every_matvec", type=int, default=25)
@@ -262,12 +284,21 @@ def main():
     )
     full_dimension = int(full_operator.shape[0])
     parity_matrix = np.atleast_2d(np.loadtxt(input_data["parity"], dtype=int))
-    labels = selected_labels(input_data, args.max_sectors)
+    mps_labels = selected_labels(input_data, args.max_sectors)
+    anchor = input_data.get("selected_sector")
+    if anchor is None:
+        anchor = mps_labels[0]
+    anchor = tuple(int(bit) for bit in anchor)
     print("system orbitals:", moldata.norb, flush=True)
     print("fixed-spin electrons:", moldata.nelec, flush=True)
     print("fixed-spin CI dimension:", f"{full_dimension:,}", flush=True)
     print("parent DMRG reference energy:", f"{reference_energy:.12f} Ha", flush=True)
-    print("selected MPS-screened labels:", [label_text(x) for x in labels], flush=True)
+    print(
+        "selected MPS-screened labels:",
+        [label_text(x) for x in mps_labels],
+        flush=True,
+    )
+    print("optimized anchor label:", label_text(anchor), flush=True)
 
     stage("2/7 Build JW Pauli LCU and one Clifford frame")
     jw_start = time.perf_counter()
@@ -301,7 +332,92 @@ def main():
     )
     print("Clifford/JW construction time:", f"{clifford_seconds:.2f} s", flush=True)
 
-    stage("3/7 Generate only selected fixed-spin sector supports")
+    stage("3/7 Solve the anchor and select sectors from its leakage")
+    anchor_support = selected_sector_supports(
+        parity_matrix,
+        [anchor],
+        moldata.norb,
+        moldata.nelec,
+        frame["clifford"],
+        frame["n_symmetries"],
+    )[anchor]
+    anchor_checkpoint = sector_dir / f"sector_{label_text(anchor)}.npz"
+    anchor_result = load_or_build_sector(
+        anchor_checkpoint,
+        anchor_support,
+        full_operator,
+        full_dimension,
+        args,
+        root_count=max(1, args.roots_per_sector),
+    )
+    validate_anchor_energy(
+        input_data,
+        anchor,
+        anchor_result["energies"][0],
+        args.anchor_tolerance,
+    )
+    leakage_rank, leakage_norm_sq, anchor_residual = sector_leakage_weights(
+        full_operator,
+        full_dimension,
+        anchor_support["full_addresses"],
+        anchor_result["vectors"][:, 0],
+        anchor_result["energies"][0],
+        parity_matrix,
+        moldata.norb,
+        moldata.nelec,
+    )
+    leakage_map = {
+        label: weight for label, weight in leakage_rank if label != anchor
+    }
+    external_norm_sq = sum(leakage_map.values())
+    print(
+        "anchor external leakage norm:",
+        f"{np.sqrt(external_norm_sq):.8e} Ha",
+        flush=True,
+    )
+    print("top leakage-ranked sectors:", flush=True)
+    for number, (label, weight) in enumerate(
+        list(leakage_map.items())[: args.max_sectors - 1], start=1
+    ):
+        fraction = 0.0 if external_norm_sq == 0.0 else weight / external_norm_sq
+        print(
+            f"  {number:2d}. {label_text(label)} "
+            f"weight={weight:.8e} fraction={fraction:.6%}",
+            flush=True,
+        )
+
+    if args.sector_selection == "leakage":
+        labels = [anchor]
+        labels.extend(list(leakage_map)[: args.max_sectors - 1])
+        for label in mps_labels:
+            if label not in labels and len(labels) < args.max_sectors:
+                labels.append(label)
+    else:
+        labels = list(mps_labels)
+        if anchor in labels:
+            labels.remove(anchor)
+        labels.insert(0, anchor)
+        labels = labels[: args.max_sectors]
+    print(
+        f"final {args.sector_selection}-selected labels:",
+        [label_text(label) for label in labels],
+        flush=True,
+    )
+    atomic_json(
+        work_dir / "leakage_selection.json",
+        {
+            "anchor": list(anchor),
+            "external_leakage_norm_squared": float(external_norm_sq),
+            "total_residual_norm_squared": float(leakage_norm_sq),
+            "ranking": [
+                {"label": list(label), "weight": float(weight)}
+                for label, weight in leakage_map.items()
+            ],
+            "selected_labels": [list(label) for label in labels],
+        },
+    )
+
+    stage("4/7 Generate supports and diagonal tapered Pauli LCUs")
     support_start = time.perf_counter()
     supports = selected_sector_supports(
         parity_matrix,
@@ -321,7 +437,6 @@ def main():
     )
     print("support construction time:", f"{support_seconds:.2f} s", flush=True)
 
-    stage("4/7 Construct selected diagonal tapered Pauli LCUs")
     lcu_metadata = {}
     if args.skip_lcu_files:
         print("LCU serialization skipped by --skip_lcu_files", flush=True)
@@ -352,9 +467,19 @@ def main():
                 flush=True,
             )
 
-    stage("5/7 Solve low roots of each selected sector with Lanczos")
-    sector_results = {}
+    stage("5/7 Solve and adaptively expand roots in selected sectors")
+    sector_results = {
+        anchor: {**supports[anchor], **anchor_result}
+    }
+    root_capture = {label_text(anchor): 1.0}
     for number, label in enumerate(labels, start=1):
+        if label == anchor:
+            print(
+                f"[sector progress] {number}/{len(labels)} labels; "
+                f"current={label_text(label)} already solved as anchor",
+                flush=True,
+            )
+            continue
         print(
             f"[sector progress] {number}/{len(labels)} labels; "
             f"current={label_text(label)}",
@@ -368,11 +493,43 @@ def main():
             full_dimension,
             args,
         )
-        validate_anchor_energy(
-            input_data,
-            label,
-            sector_results[label]["energies"][0],
-            args.anchor_tolerance,
+        capture = coupling_capture(
+            sector_results[label],
+            anchor_residual,
+            leakage_map.get(label, 0.0),
+        )
+        while (
+            capture < args.root_coupling_capture
+            and len(sector_results[label]["energies"])
+            < args.max_roots_per_sector
+        ):
+            next_roots = min(
+                args.max_roots_per_sector,
+                len(sector_results[label]["energies"]) + args.root_batch_size,
+            )
+            print(
+                f"[sector {label_text(label)}] coupling capture "
+                f"{capture:.3%}; increasing roots to {next_roots}",
+                flush=True,
+            )
+            sector_results[label] = load_or_build_sector(
+                checkpoint,
+                supports[label],
+                full_operator,
+                full_dimension,
+                args,
+                root_count=next_roots,
+            )
+            capture = coupling_capture(
+                sector_results[label],
+                anchor_residual,
+                leakage_map.get(label, 0.0),
+            )
+        root_capture[label_text(label)] = float(capture)
+        print(
+            f"[sector {label_text(label)}] represented anchor coupling: "
+            f"{capture:.6%} with {len(sector_results[label]['energies'])} roots",
+            flush=True,
         )
         atomic_json(
             progress_path,
@@ -383,6 +540,7 @@ def main():
                 ],
                 "completed_count": len(sector_results),
                 "total_count": len(labels),
+                "root_coupling_capture": root_capture,
                 "updated": timestamp(),
             },
         )
@@ -441,15 +599,16 @@ def main():
     print("coupled Hermiticity error:", f"{hermiticity_error:.3e}", flush=True)
     print("coupled construction time:", f"{coupled_seconds:.2f} s", flush=True)
 
-    selection = one_shot_from_hamiltonian(
+    selection = iterative_pt_from_hamiltonian(
         coupled,
         e_exact=reference_energy,
         tol=args.chemical_accuracy,
         tau_pt=args.tau_pt,
+        batch_size=args.pt_batch_size,
         keys=[(tuple(item["label"]), item["root"]) for item in candidates],
     )
     curve = selection.as_curve()
-    print("one-shot perturbative starting K:", selection.K_pt, flush=True)
+    print("iterative perturbative final K:", selection.K_pt, flush=True)
     print("chemical-accuracy K:", selection.K, flush=True)
     print("coupled convergence reached:", selection.converged, flush=True)
     print("coupled energy:", selection.e_coupled, flush=True)
@@ -473,6 +632,12 @@ def main():
             "matvec_seconds": float(result["matvec_seconds"]),
             "reference_weight": float(
                 input_data.get("sector_weights", {}).get(text_label, 0.0)
+            ),
+            "anchor_leakage_weight": float(
+                leakage_map.get(label, 0.0)
+            ),
+            "anchor_coupling_capture": float(
+                root_capture.get(text_label, 0.0)
             ),
             "reused": bool(result["reused"]),
         }
@@ -500,6 +665,10 @@ def main():
         "sector_label_count": len(labels),
         "candidate_state_count": len(candidates),
         "sector_labels": [list(label) for label in labels],
+        "sector_selection_method": args.sector_selection,
+        "anchor_sector": list(anchor),
+        "anchor_external_leakage_norm_squared": float(external_norm_sq),
+        "root_coupling_capture": root_capture,
         "sector_eigenstates": candidates,
         "sector_results": sector_metadata,
         "n_parent_qubits": int(frame["n_qubits"]),

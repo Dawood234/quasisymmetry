@@ -167,6 +167,75 @@ def selected_sector_supports(
     return supports
 
 
+def sector_leakage_weights(
+    full_operator,
+    full_dimension,
+    anchor_support,
+    anchor_vector,
+    anchor_energy,
+    parity_matrix,
+    norb,
+    nelec,
+):
+    """Resolve ``||(I-P_anchor) H |phi_anchor>||^2`` by parity sector."""
+    anchor_support = np.asarray(anchor_support, dtype=np.int64)
+    full_vector = np.zeros(full_dimension, dtype=np.complex128)
+    full_vector[anchor_support] = np.asarray(anchor_vector)
+    residual = np.asarray(full_operator @ full_vector, dtype=np.complex128)
+    residual[anchor_support] -= float(anchor_energy) * np.asarray(anchor_vector)
+
+    n_alpha, n_beta = (int(nelec[0]), int(nelec[1]))
+    alpha_rows, beta_rows = parity_spin_blocks(parity_matrix, norb)
+    alpha_strings = np.asarray(
+        pyscf.fci.cistring.make_strings(range(norb), n_alpha), dtype=np.int64
+    )
+    beta_strings = np.asarray(
+        pyscf.fci.cistring.make_strings(range(norb), n_beta), dtype=np.int64
+    )
+    alpha_syndromes = np.asarray(
+        [bitstring_syndrome(value, alpha_rows) for value in alpha_strings],
+        dtype=np.uint8,
+    )
+    beta_syndromes = np.asarray(
+        [bitstring_syndrome(value, beta_rows) for value in beta_strings],
+        dtype=np.uint8,
+    )
+
+    addresses = np.flatnonzero(np.abs(residual) > 1.0e-14)
+    alpha_addresses = addresses // len(beta_strings)
+    beta_addresses = addresses % len(beta_strings)
+    labels = alpha_syndromes[alpha_addresses] ^ beta_syndromes[beta_addresses]
+    powers = 1 << np.arange(alpha_rows.shape[0], dtype=np.int64)
+    codes = labels @ powers
+    unique_codes, inverse = np.unique(codes, return_inverse=True)
+    weights = np.bincount(
+        inverse,
+        weights=np.abs(residual[addresses]) ** 2,
+    )
+
+    ranked = []
+    for code, weight in zip(unique_codes, weights):
+        if weight <= 0.0:
+            continue
+        label = tuple(
+            int((code >> bit) & 1) for bit in range(alpha_rows.shape[0])
+        )
+        ranked.append((label, float(weight)))
+    ranked.sort(key=lambda item: (-item[1], item[0]))
+    return ranked, float(np.sum(weights)), residual
+
+
+def coupling_capture(result, h_anchor, leakage_weight):
+    """Fraction of one sector's anchor coupling represented by solved roots."""
+    if leakage_weight <= 0.0:
+        return 1.0
+    support = np.asarray(result["full_addresses"], dtype=np.int64)
+    vectors = np.asarray(result["vectors"])
+    couplings = vectors.conj().T @ np.asarray(h_anchor)[support]
+    captured = float(np.sum(np.abs(couplings) ** 2))
+    return min(1.0, captured / float(leakage_weight))
+
+
 def restricted_linear_operator(full_operator, full_dimension, support, statistics):
     """Return the action ``R_s^dagger H R_s`` on one selected support."""
     support = np.asarray(support, dtype=np.int64)
