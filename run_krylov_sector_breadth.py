@@ -9,8 +9,10 @@ Earlier workflow stages and the 16-sector result are never overwritten.
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -65,9 +67,22 @@ def result_row(path):
 def write_json(path, data):
     """Write JSON through a temporary file so interrupted writes are harmless."""
     path = Path(path)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=path.name + ".",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        json.dump(data, handle, indent=2)
+        handle.write("\n")
+        temporary = Path(handle.name)
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def write_summary(run_dir, rows):
@@ -102,12 +117,41 @@ def write_summary(run_dir, rows):
     )
 
 
-def run_count(args, count, reference_result, optimized_json, shared_work_dir):
+def seed_sector_checkpoints(run_dir, work_dir):
+    """Copy existing per-sector bases into an isolated breadth work directory."""
+    destination = Path(work_dir) / "sectors"
+    destination.mkdir(parents=True, exist_ok=True)
+    sources = [Path(run_dir) / "final_selected_clifford_krylov" / "sectors"]
+    sources.extend(
+        sorted(Path(run_dir).glob("final_selected_clifford_krylov_s*/sectors"))
+    )
+
+    copied = 0
+    for source in sources:
+        if not source.exists() or source.resolve() == destination.resolve():
+            continue
+        for checkpoint in source.glob("sector_*.npz"):
+            target = destination / checkpoint.name
+            if target.exists():
+                continue
+            shutil.copy2(checkpoint, target)
+            copied += 1
+    print(
+        f"[breadth] copied {copied} reusable sector checkpoints into "
+        f"{destination}",
+        flush=True,
+    )
+
+
+def run_count(args, count, reference_result, optimized_json):
     """Run or reuse one selected-sector Krylov calculation."""
     output = args.run_dir / f"final_krylov_metrics_s{count}.json"
     if output.exists() and not args.force:
         print(f"[breadth] reusing completed {count}-sector result: {output}", flush=True)
         return output
+
+    work_dir = args.run_dir / f"final_selected_clifford_krylov_s{count}"
+    seed_sector_checkpoints(args.run_dir, work_dir)
 
     command = [
         sys.executable,
@@ -117,7 +161,7 @@ def run_count(args, count, reference_result, optimized_json, shared_work_dir):
         "--reference_result",
         str(reference_result),
         "--work_dir",
-        str(shared_work_dir),
+        str(work_dir),
         "--max_sectors",
         str(count),
         "--krylov_depths",
@@ -162,13 +206,12 @@ def main():
     if not optimized_json.exists():
         raise FileNotFoundError(optimized_json)
     reference_result = latest_parent_result(args.run_dir)
-    shared_work_dir = args.run_dir / "final_selected_clifford_krylov"
 
     print("run directory:", args.run_dir, flush=True)
     print("parent reference:", reference_result, flush=True)
     print("sector counts:", counts, flush=True)
     print("Krylov depths:", args.krylov_depths, flush=True)
-    print("shared checkpoint directory:", shared_work_dir, flush=True)
+    print("each sector count uses an isolated coupled-matrix directory", flush=True)
 
     result_paths = []
     baseline = args.run_dir / "final_krylov_metrics.json"
@@ -176,7 +219,7 @@ def main():
         result_paths.append(baseline)
     for count in counts:
         result_paths.append(
-            run_count(args, count, reference_result, optimized_json, shared_work_dir)
+            run_count(args, count, reference_result, optimized_json)
         )
 
     rows_by_count = {}

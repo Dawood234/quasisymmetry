@@ -12,6 +12,7 @@ import gzip
 import json
 import resource
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -64,9 +65,20 @@ def atomic_json(path, data):
     """Write JSON through a temporary file so restart metadata is durable."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=path.name + ".",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        json.dump(data, handle, indent=2)
+        temporary = Path(handle.name)
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def parse_dmrg_energy(path):

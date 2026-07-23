@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -6,8 +7,10 @@ from run_krylov_sector_breadth import (
     final_curve_row,
     parse_counts,
     result_row,
+    seed_sector_checkpoints,
     write_summary,
 )
+from selected_clifford_lanczos import atomic_json
 
 
 def test_parse_counts_sorts_and_removes_duplicates():
@@ -48,3 +51,29 @@ def test_result_and_summary_preserve_sector_comparison(tmp_path):
     assert row["sector_count"] == 24
     assert row["dimension"] == 553
     assert "99.000000%" in (tmp_path / "krylov_sector_breadth.md").read_text()
+
+
+def test_atomic_json_allows_concurrent_writers(tmp_path):
+    path = tmp_path / "progress.json"
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        list(workers.map(lambda value: atomic_json(path, {"value": value}), range(40)))
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["value"] in range(40)
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_seed_sector_checkpoints_reuses_bases_without_overwriting(tmp_path):
+    source = tmp_path / "final_selected_clifford_krylov" / "sectors"
+    source.mkdir(parents=True)
+    (source / "sector_0000001.npz").write_bytes(b"source")
+
+    work_dir = tmp_path / "final_selected_clifford_krylov_s32"
+    destination = work_dir / "sectors" / "sector_0000001.npz"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"existing")
+
+    seed_sector_checkpoints(tmp_path, work_dir)
+
+    assert destination.read_bytes() == b"existing"

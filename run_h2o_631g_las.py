@@ -13,6 +13,7 @@ import os
 import resource
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -26,10 +27,20 @@ def atomic_json(path, data):
     """Write valid JSON even if the job is interrupted during replacement."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=path.name + ".",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
         json.dump(data, handle, indent=2)
-    os.replace(temporary, path)
+        temporary = Path(handle.name)
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def load_json(path, default=None):
