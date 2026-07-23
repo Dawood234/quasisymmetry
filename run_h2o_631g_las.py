@@ -363,6 +363,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run_dir", default=None)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--rerun_final",
+        action="store_true",
+        help="rerun final selected-sector evaluation while reusing earlier stages",
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--cpus", type=int, default=32)
     parser.add_argument(
@@ -504,6 +509,8 @@ def main():
     current_selection = selection
     current_rotation = None
     latest_optimize = None
+    latest_optimize_parity = None
+    latest_optimize_manifest = None
     stable = False
 
     for cycle in range(1, args.max_macrocycles + 1):
@@ -529,6 +536,8 @@ def main():
         current_rotation = cycle_dir / "rotation.txt"
         write_rotation(current_rotation, optimize_json)
         latest_optimize = optimize_json
+        latest_optimize_parity = current_parity
+        latest_optimize_manifest = current_manifest
 
         post_dir = cycle_dir / "reselection"
         post_dir.mkdir(parents=True, exist_ok=True)
@@ -547,6 +556,8 @@ def main():
         record = {
             "cycle": cycle,
             "input_selection": str(current_selection),
+            "optimization_parity": str(latest_optimize_parity),
+            "optimization_manifest": str(latest_optimize_manifest),
             "optimized": str(optimize_json),
             "output_selection": str(post_selection),
             "row_space_stable": bool(stable),
@@ -567,12 +578,21 @@ def main():
     state["row_space_stable"] = bool(stable)
     state["completed_macrocycles"] = len(state.get("macrocycles", []))
     atomic_json(state_path, state)
-    if latest_optimize is None or current_rotation is None:
+    if (
+        latest_optimize is None
+        or latest_optimize_parity is None
+        or latest_optimize_manifest is None
+        or current_rotation is None
+    ):
         raise RuntimeError("no optimization macrocycle completed")
 
     final_oo = run_dir / "final_optimized.json"
     final_oo_json(
-        final_oo, latest_optimize, checkpoint, current_parity, current_manifest
+        final_oo,
+        latest_optimize,
+        checkpoint,
+        latest_optimize_parity,
+        latest_optimize_manifest,
     )
     final_rotation = run_dir / "final_rotation.txt"
     write_rotation(final_rotation, final_oo)
@@ -647,7 +667,7 @@ def main():
             str(metrics_json),
         ] + (["--resume"] if args.resume else []),
         [metrics_json],
-        args.resume,
+        args.resume and not args.rerun_final,
     )
 
     e_low = parse_energy(reference_results[0][2])

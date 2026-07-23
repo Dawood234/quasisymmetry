@@ -93,6 +93,31 @@ def selected_labels(input_data, maximum):
     return labels[: int(maximum)]
 
 
+def validate_anchor_energy(input_data, label, energy, tolerance):
+    """Check the exact anchor-sector root against the optimized DMRG value."""
+    anchor = input_data.get("selected_sector")
+    expected = input_data.get("cost_after")
+    if anchor is None or expected is None:
+        return
+    anchor = tuple(int(bit) for bit in anchor)
+    if tuple(label) != anchor:
+        return
+
+    difference = abs(float(energy) - float(expected))
+    print(
+        f"[anchor check] optimized={float(expected):.12f} Ha; "
+        f"Lanczos={float(energy):.12f} Ha; "
+        f"difference={1000.0 * difference:.6f} mHa",
+        flush=True,
+    )
+    if difference > float(tolerance):
+        raise RuntimeError(
+            "anchor-sector Lanczos energy does not match the optimized "
+            "sector energy; the generator basis or sector labels are "
+            "inconsistent"
+        )
+
+
 def load_or_build_sector(path, support, full_operator, full_dimension, args):
     """Reload one completed sector or solve and checkpoint it."""
     path = Path(path)
@@ -198,6 +223,12 @@ def parse_args():
     parser.add_argument("--lanczos_tolerance", type=float, default=1e-9)
     parser.add_argument("--lanczos_maxiter", type=int, default=None)
     parser.add_argument("--print_every_matvec", type=int, default=25)
+    parser.add_argument(
+        "--anchor_tolerance",
+        type=float,
+        default=1.0e-2,
+        help="maximum optimized-vs-Lanczos anchor energy difference in Ha",
+    )
     parser.add_argument("--chemical_accuracy", type=float, default=CHEMICAL_PRECISION)
     parser.add_argument("--tau_pt", type=float, default=1e-12)
     parser.add_argument("--resume", action="store_true")
@@ -336,6 +367,12 @@ def main():
             full_operator,
             full_dimension,
             args,
+        )
+        validate_anchor_energy(
+            input_data,
+            label,
+            sector_results[label]["energies"][0],
+            args.anchor_tolerance,
         )
         atomic_json(
             progress_path,
