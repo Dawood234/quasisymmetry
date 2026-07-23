@@ -292,7 +292,9 @@ def final_oo_json(path, optimize_json, checkpoint, parity, manifest):
     atomic_json(path, data)
 
 
-def write_summary(run_dir, state, metadata, reference_results, metrics):
+def write_summary(
+    run_dir, state, metadata, reference_results, metrics, stem="summary"
+):
     """Write compact machine-readable and Markdown run conclusions."""
     (low_bond, e_low), (high_bond, e_high) = reference_results
     difference_mha = abs(e_high - e_low) * 1000.0
@@ -336,7 +338,7 @@ def write_summary(run_dir, state, metadata, reference_results, metrics):
         "chemical_accuracy_claim_allowed": chemical_accuracy,
         "git_commit": state["git_commit"],
     }
-    atomic_json(run_dir / "summary.json", summary)
+    atomic_json(run_dir / f"{stem}.json", summary)
     lines = [
         "# H2O/6-31G LAS workflow",
         "",
@@ -355,7 +357,9 @@ def write_summary(run_dir, state, metadata, reference_results, metrics):
         f"- Final K: {metrics.get('K')}",
         f"- Chemical-accuracy claim allowed: {chemical_accuracy}",
     ]
-    (run_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (run_dir / f"{stem}.md").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
 
 
 def parse_args():
@@ -401,6 +405,18 @@ def parse_args():
     parser.add_argument("--root_batch_size", type=int, default=5)
     parser.add_argument("--root_coupling_capture", type=float, default=0.90)
     parser.add_argument("--pt_batch_size", type=int, default=4)
+    parser.add_argument(
+        "--final_evaluator",
+        choices=("roots", "krylov"),
+        default="roots",
+        help="use low sector roots or coupling-seeded sector Krylov spaces",
+    )
+    parser.add_argument(
+        "--krylov_depths",
+        default="1,2,4,8,12,16,24",
+        help="nested depths used by the coupling-seeded Krylov evaluator",
+    )
+    parser.add_argument("--krylov_tolerance", type=float, default=1.0e-12)
     return parser.parse_args()
 
 
@@ -638,23 +654,44 @@ def main():
         reference_results.append((bond, store, result_file))
 
     _, _, final_reference_result = reference_results[-1]
-    metrics_json = run_dir / "final_metrics.json"
-    selected_work_dir = run_dir / "final_selected_clifford_lanczos"
-    print(
-        "\nFinal projected evaluation uses selected Clifford sectors and "
-        "matrix-free Lanczos.",
-        flush=True,
-    )
-    print(
-        "It will not build the complete fixed-spin Hamiltonian matrix and "
-        "will checkpoint every completed sector.",
-        flush=True,
-    )
-    run_stage(
-        state_path,
-        state,
-        "07_final_selected_clifford_lanczos",
-        [
+    if args.final_evaluator == "krylov":
+        metrics_json = run_dir / "final_krylov_metrics.json"
+        stage_name = "07_final_selected_clifford_krylov"
+        selected_work_dir = run_dir / "final_selected_clifford_krylov"
+        anchor_checkpoint_dir = (
+            run_dir / "final_selected_clifford_lanczos" / "sectors"
+        )
+        final_command = [
+            sys.executable,
+            "-u",
+            str(PROJECT_DIR / "selected_clifford_krylov.py"),
+            str(final_oo),
+            "--reference_result",
+            str(final_reference_result),
+            "--work_dir",
+            str(selected_work_dir),
+            "--anchor_checkpoint_dir",
+            str(anchor_checkpoint_dir),
+            "--max_sectors",
+            str(args.max_dominant_sectors),
+            "--krylov_depths",
+            str(args.krylov_depths),
+            "--krylov_tolerance",
+            str(args.krylov_tolerance),
+            "--skip_lcu_files",
+            "--outname",
+            str(metrics_json),
+        ]
+        print(
+            "\nFinal projected evaluation uses coupling-seeded Krylov spaces "
+            "inside selected Clifford sectors.",
+            flush=True,
+        )
+    else:
+        metrics_json = run_dir / "final_metrics.json"
+        stage_name = "07_final_selected_clifford_lanczos"
+        selected_work_dir = run_dir / "final_selected_clifford_lanczos"
+        final_command = [
             sys.executable,
             "-u",
             str(PROJECT_DIR / "selected_clifford_lanczos.py"),
@@ -677,7 +714,22 @@ def main():
             str(args.pt_batch_size),
             "--outname",
             str(metrics_json),
-        ] + (["--resume"] if args.resume else []),
+        ]
+        print(
+            "\nFinal projected evaluation uses low roots inside selected "
+            "Clifford sectors.",
+            flush=True,
+        )
+    print(
+        "It will not build the complete fixed-spin Hamiltonian matrix and "
+        "will checkpoint every completed sector.",
+        flush=True,
+    )
+    run_stage(
+        state_path,
+        state,
+        stage_name,
+        final_command + (["--resume"] if args.resume else []),
         [metrics_json],
         args.resume and not args.rerun_final,
     )
@@ -691,6 +743,7 @@ def main():
         metadata,
         [(reference_results[0][0], e_low), (reference_results[1][0], e_high)],
         metrics,
+        stem=("summary_krylov" if args.final_evaluator == "krylov" else "summary"),
     )
     print("\nWorkflow complete:", run_dir, flush=True)
 

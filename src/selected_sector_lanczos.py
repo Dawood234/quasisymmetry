@@ -236,6 +236,190 @@ def coupling_capture(result, h_anchor, leakage_weight):
     return min(1.0, captured / float(leakage_weight))
 
 
+def orthogonalize_vector(vector, basis, tolerance=1.0e-12):
+    """Remove components along an orthonormal basis with two stable passes."""
+    vector = np.asarray(vector, dtype=np.complex128).copy()
+    basis = np.asarray(basis, dtype=np.complex128)
+    if basis.size:
+        for _pass in range(2):
+            vector -= basis @ (basis.conj().T @ vector)
+    norm = float(np.linalg.norm(vector))
+    if norm <= float(tolerance):
+        return None, norm
+    return vector / norm, norm
+
+
+def coupling_seeded_krylov_basis(
+    full_operator,
+    full_dimension,
+    support,
+    coupling_seed,
+    max_depth,
+    tolerance=1.0e-12,
+    print_every=5,
+):
+    """Build ``span{q, H_ss q, ...}`` from one sector's leakage vector.
+
+    The input ``coupling_seed`` is the selected-sector part of
+    ``H|phi_anchor>``.  Starting from this vector targets the states that
+    actually couple to the optimized anchor, rather than the lowest-energy
+    eigenstates of the external sector.
+    """
+    support = np.asarray(support, dtype=np.int64)
+    seed = np.asarray(coupling_seed, dtype=np.complex128)
+    if len(seed) != len(support):
+        raise ValueError("coupling seed must match the selected-sector support")
+    if int(max_depth) < 1:
+        raise ValueError("max_depth must be positive")
+
+    seed_norm = float(np.linalg.norm(seed))
+    if seed_norm <= float(tolerance):
+        return {
+            "basis": np.zeros((len(support), 0), dtype=np.complex128),
+            "projected_hamiltonian": np.zeros((0, 0), dtype=np.complex128),
+            "seed_norm": seed_norm,
+            "depth": 0,
+            "matvec_count": 0,
+            "matvec_seconds": 0.0,
+            "elapsed_seconds": 0.0,
+            "breakdown": True,
+        }
+
+    statistics = {
+        "matvec_count": 0,
+        "matvec_seconds": 0.0,
+        "print_every": 0,
+    }
+    operator = restricted_linear_operator(
+        full_operator, full_dimension, support, statistics
+    )
+    started = time.perf_counter()
+    basis_vectors = [seed / seed_norm]
+    actions = []
+    breakdown = False
+
+    for depth in range(int(max_depth)):
+        action = np.asarray(operator @ basis_vectors[depth], dtype=np.complex128)
+        actions.append(action)
+        if print_every and (depth + 1) % int(print_every) == 0:
+            print(
+                f"[Krylov] completed depth {depth + 1}/{int(max_depth)}; "
+                f"H-action time={statistics['matvec_seconds']:.1f} s",
+                flush=True,
+            )
+        if depth + 1 == int(max_depth):
+            break
+
+        current_basis = np.column_stack(basis_vectors)
+        next_vector, norm = orthogonalize_vector(
+            action, current_basis, tolerance=tolerance
+        )
+        if next_vector is None:
+            print(
+                f"[Krylov] invariant subspace reached at depth {depth + 1}; "
+                f"residual norm={norm:.3e}",
+                flush=True,
+            )
+            breakdown = True
+            break
+        basis_vectors.append(next_vector)
+
+    basis = np.column_stack(basis_vectors)
+    action_matrix = np.column_stack(actions)
+    projected = basis.conj().T @ action_matrix
+    projected = 0.5 * (projected + projected.conj().T)
+    return {
+        "basis": basis,
+        "projected_hamiltonian": projected,
+        "seed_norm": seed_norm,
+        "depth": int(basis.shape[1]),
+        "matvec_count": int(statistics["matvec_count"]),
+        "matvec_seconds": float(statistics["matvec_seconds"]),
+        "elapsed_seconds": float(time.perf_counter() - started),
+        "breakdown": bool(breakdown),
+    }
+
+
+def coupled_krylov_matrix(
+    full_operator,
+    full_dimension,
+    anchor_support,
+    anchor_vector,
+    sector_bases,
+):
+    """Build the coupled Hamiltonian in the anchor plus sector-Krylov basis."""
+    candidates = [
+        {
+            "label": tuple(anchor_support["label"]),
+            "depth": 0,
+            "support": np.asarray(
+                anchor_support["full_addresses"], dtype=np.int64
+            ),
+            "vector": np.asarray(anchor_vector, dtype=np.complex128),
+            "kind": "anchor",
+        }
+    ]
+    for label in sorted(sector_bases):
+        result = sector_bases[label]
+        basis = np.asarray(result["basis"], dtype=np.complex128)
+        support = np.asarray(result["full_addresses"], dtype=np.int64)
+        for depth in range(basis.shape[1]):
+            candidates.append(
+                {
+                    "label": tuple(label),
+                    "depth": int(depth + 1),
+                    "support": support,
+                    "vector": basis[:, depth],
+                    "kind": "krylov",
+                }
+            )
+
+    count = len(candidates)
+    matrix = np.zeros((count, count), dtype=np.complex128)
+    started = time.perf_counter()
+    for column, ket in enumerate(candidates):
+        full_vector = np.zeros(full_dimension, dtype=np.complex128)
+        full_vector[ket["support"]] = ket["vector"]
+        h_vector = np.asarray(full_operator @ full_vector, dtype=np.complex128)
+        for row, bra in enumerate(candidates):
+            matrix[row, column] = np.vdot(
+                bra["vector"], h_vector[bra["support"]]
+            )
+        if (column + 1) % 20 == 0 or column + 1 == count:
+            print(
+                f"[coupled Krylov] H action {column + 1}/{count}",
+                flush=True,
+            )
+
+    matrix = 0.5 * (matrix + matrix.conj().T)
+    return matrix, candidates, float(time.perf_counter() - started)
+
+
+def krylov_depth_curve(matrix, candidates, depths, reference_energy, tolerance):
+    """Diagonalize nested spaces containing up to each depth per sector."""
+    curve = []
+    for depth in sorted(set(int(value) for value in depths)):
+        indices = [
+            index
+            for index, candidate in enumerate(candidates)
+            if candidate["kind"] == "anchor" or candidate["depth"] <= depth
+        ]
+        selected = matrix[np.ix_(indices, indices)]
+        energy = float(np.linalg.eigvalsh(selected)[0])
+        error = energy - float(reference_energy)
+        curve.append(
+            {
+                "depth": depth,
+                "dimension": len(indices),
+                "energy": energy,
+                "error_Ha": error,
+                "error_mHa": 1000.0 * error,
+                "converged": bool(error <= float(tolerance)),
+            }
+        )
+    return curve
+
+
 def restricted_linear_operator(full_operator, full_dimension, support, statistics):
     """Return the action ``R_s^dagger H R_s`` on one selected support."""
     support = np.asarray(support, dtype=np.int64)
