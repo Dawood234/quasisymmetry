@@ -184,6 +184,25 @@ def sector_leakage_weights(
     residual = np.asarray(full_operator @ full_vector, dtype=np.complex128)
     residual[anchor_support] -= float(anchor_energy) * np.asarray(anchor_vector)
 
+    ranked, norm_squared = sector_vector_weights(
+        residual,
+        parity_matrix,
+        norb,
+        nelec,
+    )
+    return ranked, norm_squared, residual
+
+
+def sector_vector_weights(
+    vector,
+    parity_matrix,
+    norb,
+    nelec,
+    threshold=1.0e-14,
+):
+    """Resolve the squared norm of a fixed-spin vector by parity sector."""
+    vector = np.asarray(vector, dtype=np.complex128)
+
     n_alpha, n_beta = (int(nelec[0]), int(nelec[1]))
     alpha_rows, beta_rows = parity_spin_blocks(parity_matrix, norb)
     alpha_strings = np.asarray(
@@ -201,7 +220,13 @@ def sector_leakage_weights(
         dtype=np.uint8,
     )
 
-    addresses = np.flatnonzero(np.abs(residual) > 1.0e-14)
+    expected_dimension = len(alpha_strings) * len(beta_strings)
+    if vector.shape != (expected_dimension,):
+        raise ValueError("vector has the wrong fixed-spin dimension")
+
+    addresses = np.flatnonzero(np.abs(vector) > float(threshold))
+    if len(addresses) == 0:
+        return [], 0.0
     alpha_addresses = addresses // len(beta_strings)
     beta_addresses = addresses % len(beta_strings)
     labels = alpha_syndromes[alpha_addresses] ^ beta_syndromes[beta_addresses]
@@ -210,7 +235,7 @@ def sector_leakage_weights(
     unique_codes, inverse = np.unique(codes, return_inverse=True)
     weights = np.bincount(
         inverse,
-        weights=np.abs(residual[addresses]) ** 2,
+        weights=np.abs(vector[addresses]) ** 2,
     )
 
     ranked = []
@@ -222,7 +247,7 @@ def sector_leakage_weights(
         )
         ranked.append((label, float(weight)))
     ranked.sort(key=lambda item: (-item[1], item[0]))
-    return ranked, float(np.sum(weights)), residual
+    return ranked, float(np.sum(weights))
 
 
 def coupling_capture(result, h_anchor, leakage_weight):
@@ -340,18 +365,70 @@ def coupling_seeded_krylov_basis(
     }
 
 
-def coupled_krylov_matrix(
+def residual_seeded_krylov_extension(
     full_operator,
     full_dimension,
-    anchor_support,
-    anchor_vector,
-    sector_bases,
+    support,
+    residual_seed,
+    existing_basis,
+    max_vectors,
+    tolerance=1.0e-12,
 ):
-    """Build the coupled Hamiltonian in the anchor plus sector-Krylov basis."""
+    """Build new sector vectors from a coupled-state residual component.
+
+    Every returned vector is orthogonal to ``existing_basis`` and to the other
+    vectors generated in this call.  The recurrence uses the diagonal sector
+    action ``R_s^dagger H R_s``.
+    """
+    support = np.asarray(support, dtype=np.int64)
+    seed = np.asarray(residual_seed, dtype=np.complex128)
+    existing = np.asarray(existing_basis, dtype=np.complex128)
+    if existing.size == 0:
+        existing = np.zeros((len(support), 0), dtype=np.complex128)
+    if existing.ndim != 2 or existing.shape[0] != len(support):
+        raise ValueError("existing basis must have one row per support address")
+    if seed.shape != (len(support),):
+        raise ValueError("residual seed must match the selected-sector support")
+    if int(max_vectors) < 1:
+        return np.zeros((len(support), 0), dtype=np.complex128)
+
+    first, _norm = orthogonalize_vector(seed, existing, tolerance=tolerance)
+    if first is None:
+        return np.zeros((len(support), 0), dtype=np.complex128)
+
+    statistics = {
+        "matvec_count": 0,
+        "matvec_seconds": 0.0,
+        "print_every": 0,
+    }
+    operator = restricted_linear_operator(
+        full_operator,
+        full_dimension,
+        support,
+        statistics,
+    )
+    vectors = [first]
+    while len(vectors) < int(max_vectors):
+        action = np.asarray(operator @ vectors[-1], dtype=np.complex128)
+        combined = np.column_stack([existing, *vectors])
+        next_vector, _norm = orthogonalize_vector(
+            action,
+            combined,
+            tolerance=tolerance,
+        )
+        if next_vector is None:
+            break
+        vectors.append(next_vector)
+    return np.column_stack(vectors)
+
+
+def krylov_candidates(anchor_support, anchor_vector, sector_bases):
+    """Return the ordered full-space basis metadata for a coupled matrix."""
     candidates = [
         {
             "label": tuple(anchor_support["label"]),
             "depth": 0,
+            "sector_column": 0,
             "support": np.asarray(
                 anchor_support["full_addresses"], dtype=np.int64
             ),
@@ -363,16 +440,29 @@ def coupled_krylov_matrix(
         result = sector_bases[label]
         basis = np.asarray(result["basis"], dtype=np.complex128)
         support = np.asarray(result["full_addresses"], dtype=np.int64)
-        for depth in range(basis.shape[1]):
+        for column in range(basis.shape[1]):
             candidates.append(
                 {
                     "label": tuple(label),
-                    "depth": int(depth + 1),
+                    "depth": int(column + 1),
+                    "sector_column": int(column),
                     "support": support,
-                    "vector": basis[:, depth],
+                    "vector": basis[:, column],
                     "kind": "krylov",
                 }
             )
+    return candidates
+
+
+def coupled_krylov_matrix(
+    full_operator,
+    full_dimension,
+    anchor_support,
+    anchor_vector,
+    sector_bases,
+):
+    """Build the coupled Hamiltonian in the anchor plus sector-Krylov basis."""
+    candidates = krylov_candidates(anchor_support, anchor_vector, sector_bases)
 
     count = len(candidates)
     matrix = np.zeros((count, count), dtype=np.complex128)
@@ -393,6 +483,63 @@ def coupled_krylov_matrix(
 
     matrix = 0.5 * (matrix + matrix.conj().T)
     return matrix, candidates, float(time.perf_counter() - started)
+
+
+def assemble_candidate_state(candidates, coefficients, full_dimension):
+    """Lift coupled-basis coefficients into the full fixed-spin vector."""
+    coefficients = np.asarray(coefficients, dtype=np.complex128)
+    if len(coefficients) != len(candidates):
+        raise ValueError("one coefficient is required for every candidate")
+    state = np.zeros(int(full_dimension), dtype=np.complex128)
+    for coefficient, candidate in zip(coefficients, candidates):
+        state[candidate["support"]] += coefficient * candidate["vector"]
+    return state
+
+
+def coupled_ground_residual(full_operator, full_dimension, matrix, candidates):
+    """Diagonalize a coupled matrix and return its full-space residual."""
+    energies, vectors = np.linalg.eigh(np.asarray(matrix))
+    energy = float(np.real(energies[0]))
+    coefficients = np.asarray(vectors[:, 0], dtype=np.complex128)
+    state = assemble_candidate_state(candidates, coefficients, full_dimension)
+    residual = np.asarray(full_operator @ state, dtype=np.complex128)
+    residual -= energy * state
+    return energy, coefficients, state, residual
+
+
+def extend_coupled_matrix(
+    full_operator,
+    full_dimension,
+    matrix,
+    candidates,
+    new_candidates,
+    print_every=10,
+):
+    """Append orthonormal candidates using one Hamiltonian action per vector."""
+    old_count = len(candidates)
+    all_candidates = list(candidates) + list(new_candidates)
+    new_count = len(all_candidates)
+    extended = np.zeros((new_count, new_count), dtype=np.complex128)
+    extended[:old_count, :old_count] = np.asarray(matrix)
+
+    started = time.perf_counter()
+    for offset, ket in enumerate(new_candidates, start=1):
+        column = old_count + offset - 1
+        full_vector = np.zeros(int(full_dimension), dtype=np.complex128)
+        full_vector[ket["support"]] = ket["vector"]
+        h_vector = np.asarray(full_operator @ full_vector, dtype=np.complex128)
+        for row, bra in enumerate(all_candidates):
+            value = np.vdot(bra["vector"], h_vector[bra["support"]])
+            extended[row, column] = value
+            extended[column, row] = np.conjugate(value)
+        if print_every and (offset % int(print_every) == 0 or offset == len(new_candidates)):
+            print(
+                f"[coupled extension] H action {offset}/{len(new_candidates)}",
+                flush=True,
+            )
+
+    extended = 0.5 * (extended + extended.conj().T)
+    return extended, all_candidates, float(time.perf_counter() - started)
 
 
 def krylov_depth_curve(matrix, candidates, depths, reference_energy, tolerance):
