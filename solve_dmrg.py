@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 from pathlib import Path
 
@@ -117,6 +118,10 @@ def build_solver(args: argparse.Namespace) -> Block2DMRGSolver:
         reorder=args.reorder,
         orbital_symmetries=orbital_symmetries,
         target_irrep=target_irrep,
+        symmetry_mode=args.symmetry_mode,
+        n_mkl_threads=args.n_mkl_threads,
+        stack_mem_bytes=int(args.stack_mem_gb * (1024**3)),
+        restart_dir=args.restart_dir,
     )
 
 
@@ -170,6 +175,29 @@ def main() -> None:
         help="warm-start from this tag in the same --store_dir",
     )
     parser.add_argument("--n_threads", type=int, default=4)
+    parser.add_argument(
+        "--n_mkl_threads",
+        type=int,
+        default=1,
+        help="nested MKL threads inside each Block2 worker (normally 1)",
+    )
+    parser.add_argument(
+        "--symmetry_mode",
+        choices=("sz", "su2"),
+        default="sz",
+        help="Block2 spin symmetry; SU(2) is usually cheaper for singlets",
+    )
+    parser.add_argument(
+        "--stack_mem_gb",
+        type=float,
+        default=1.0,
+        help="Block2 operator-stack memory in GiB",
+    )
+    parser.add_argument(
+        "--restart_dir",
+        default=None,
+        help="optional directory where Block2 copies the MPS after each sweep",
+    )
     parser.add_argument("--penalty", type=float, default=30.0,
                         help="sector penalty strength (Hartree)")
     parser.add_argument("--decoupled", action="store_true",
@@ -204,6 +232,21 @@ def main() -> None:
                         help="re-solve even if a stored wavefunction exists")
     parser.add_argument("--outname", default=None,
                         help="results file (default: <store_dir>/result.txt)")
+    parser.add_argument(
+        "--result_json",
+        default=None,
+        help="optional structured DMRG result, including every sweep",
+    )
+    parser.add_argument(
+        "--save_rdms",
+        default=None,
+        help="optional .npz output for final one- and two-particle RDMs",
+    )
+    parser.add_argument(
+        "--save_entanglement",
+        default=None,
+        help="optional .npz output for bipartite/orbital entropies",
+    )
     args = parser.parse_args()
 
     if args.k_coupled:
@@ -235,6 +278,10 @@ def main() -> None:
         )
     )
     report(f"target_irrep {solver.target_irrep}")
+    report(f"symmetry_mode {solver.symmetry_mode}")
+    report(f"n_threads {solver.n_threads}")
+    report(f"n_mkl_threads {solver.n_mkl_threads}")
+    report(f"stack_mem_gb {solver.stack_mem_bytes / (1024**3):.3f}")
 
     config = DMRGConfig(
         max_bond_dim=args.bond_dim,
@@ -254,6 +301,13 @@ def main() -> None:
         initial_mps_tag=args.initial_mps_tag,
     )
     report(f"E_DMRG {result.energy:.10f} (bond_dim {args.bond_dim})")
+    report(f"completed_sweeps {len(result.sweep_history)}")
+    if result.sweep_history:
+        last_sweep = result.sweep_history[-1]
+        report(
+            "final_discarded_weight "
+            f"{last_sweep['discarded_weight']:.12e}"
+        )
 
     parity_matrix = None
     if args.parity_matrix is not None:
@@ -313,8 +367,71 @@ def main() -> None:
                 f"mutual_information_max {float(np.max(ent.mutual_information)):.6f}"
             )
 
-    with open(outname, "w", encoding="utf-8") as fp:
+    if args.save_rdms is not None:
+        rdm_path = Path(args.save_rdms)
+        rdm_path.parent.mkdir(parents=True, exist_ok=True)
+        ket = solver.get_mps(result.mps_tag)
+        rdm1, rdm2 = solver.spin_resolved_rdms(ket)
+        np.savez_compressed(rdm_path, rdm1=rdm1, rdm2=rdm2)
+        report(f"rdms_written {rdm_path}")
+
+    if args.save_entanglement is not None:
+        ent_path = Path(args.save_entanglement)
+        ent_path.parent.mkdir(parents=True, exist_ok=True)
+        ket = solver.get_mps(result.mps_tag)
+        entanglement_data = {
+            "bipartite": solver.bipartite_entanglement(ket),
+        }
+        try:
+            entanglement_data["orbital_s1"] = solver.orbital_entropies(
+                ket, orb_type=1
+            )
+            entanglement_data["mutual_information"] = (
+                solver.mutual_information(ket)
+            )
+            entanglement_data["orbital_entropy_available"] = np.asarray(True)
+        except RuntimeError as error:
+            # Some Block2 builds cannot form SU(2) orbital NPDM masks. The
+            # reference energy and MPS remain valid, so retain the available
+            # bipartite data instead of failing the complete calculation.
+            entanglement_data["orbital_s1"] = np.asarray([], dtype=float)
+            entanglement_data["mutual_information"] = np.empty((0, 0))
+            entanglement_data["orbital_entropy_available"] = np.asarray(False)
+            report(f"orbital_entropy_unavailable {error}")
+        np.savez_compressed(
+            ent_path,
+            **entanglement_data,
+        )
+        report(f"entanglement_written {ent_path}")
+
+    out_path = Path(outname)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as fp:
         fp.write("\n".join(lines) + "\n")
+    if args.result_json is not None:
+        result_path = Path(args.result_json)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        data = result.to_dict()
+        data["system"] = {
+            "norb": solver.n_sites,
+            "nelec": solver.n_elec,
+            "spin": solver.spin,
+            "orbital_permutation": list(solver.orbital_permutation),
+            "orbital_symmetries": (
+                None
+                if solver.orbital_symmetries is None
+                else list(solver.orbital_symmetries)
+            ),
+            "target_irrep": solver.target_irrep,
+            "symmetry_mode": solver.symmetry_mode,
+            "n_threads": solver.n_threads,
+            "n_mkl_threads": solver.n_mkl_threads,
+            "stack_mem_bytes": solver.stack_mem_bytes,
+        }
+        result_path.write_text(
+            json.dumps(data, indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"structured result written to {result_path}")
     print(f"results written to {outname}")
 
 

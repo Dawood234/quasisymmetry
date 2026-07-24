@@ -1,6 +1,6 @@
 """Reusable block2 DMRG solver for the quasisymmetry pipeline.
 
-This module wraps ``pyblock2`` in fermionic SZ mode and provides:
+This module wraps ``pyblock2`` in fermionic SZ or SU(2) mode and provides:
 
 * ground-state DMRG directly from spatial-orbital integrals or FCIDUMP files,
 * local, reloadable wavefunction storage (block2 MPS files + JSON metadata),
@@ -364,6 +364,8 @@ class DMRGResult:
     symmetry_expectations: tuple[float, ...] | None = None
     energies: tuple[float, ...] | None = None
     """For multi-root solves: bare energies of each extracted root."""
+    sweep_history: tuple[dict, ...] = field(default=())
+    """Per-sweep bond dimensions, discarded weights, and energies."""
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -435,7 +437,7 @@ def rotation_preserves_orbital_symmetries(
 
 
 class Block2DMRGSolver:
-    """Fermionic (SZ-mode) block2 DMRG solver with local wavefunction storage.
+    """Fermionic block2 DMRG solver with local wavefunction storage.
 
     All MPS tensors live inside ``store_dir`` (the block2 scratch directory),
     so a solved wavefunction can be reloaded later with
@@ -456,6 +458,10 @@ class Block2DMRGSolver:
         reorder: str | None = None,
         orbital_symmetries: Sequence[int] | None = None,
         target_irrep: int = 0,
+        symmetry_mode: str = "sz",
+        n_mkl_threads: int = 1,
+        stack_mem_bytes: int = 1 << 30,
+        restart_dir: str | Path | None = None,
     ) -> None:
         _require_pyblock2()
         h1e = np.ascontiguousarray(h1e, dtype=np.float64)
@@ -492,6 +498,18 @@ class Block2DMRGSolver:
         self.orbital_permutation = orbital_permutation
         self.orbital_symmetries = orbital_symmetries
         self.target_irrep = int(target_irrep)
+        self.symmetry_mode = str(symmetry_mode).lower()
+        if self.symmetry_mode not in ("sz", "su2"):
+            raise ValueError("symmetry_mode must be 'sz' or 'su2'")
+        self.n_mkl_threads = int(n_mkl_threads)
+        if self.n_mkl_threads < 1:
+            raise ValueError("n_mkl_threads must be positive")
+        self.stack_mem_bytes = int(stack_mem_bytes)
+        if self.stack_mem_bytes < 1:
+            raise ValueError("stack_mem_bytes must be positive")
+        self.restart_dir = None if restart_dir is None else Path(restart_dir)
+        if self.restart_dir is not None:
+            self.restart_dir.mkdir(parents=True, exist_ok=True)
         self.fingerprint = _integral_fingerprint(self.h1e, self.g2e, self.ecore)
 
         if store_dir is None:
@@ -548,8 +566,17 @@ class Block2DMRGSolver:
             return
         self.driver = DMRGDriver(
             scratch=str(self.store_dir),
-            symm_type=SymmetryTypes.SZ,
+            symm_type=(
+                SymmetryTypes.SU2
+                if self.symmetry_mode == "su2"
+                else SymmetryTypes.SZ
+            ),
             n_threads=self.n_threads,
+            n_mkl_threads=self.n_mkl_threads,
+            stack_mem=self.stack_mem_bytes,
+            restart_dir=(
+                None if self.restart_dir is None else str(self.restart_dir)
+            ),
         )
         self.driver.initialize_system(
             n_sites=self.n_sites,
@@ -679,6 +706,11 @@ class Block2DMRGSolver:
             orbital_permutation=perm,
             orbital_symmetries=orbital_symmetries,
             target_irrep=int(metadata["system"].get("target_irrep", 0)),
+            symmetry_mode=str(metadata["system"].get("symmetry_mode", "sz")),
+            n_mkl_threads=int(metadata["system"].get("n_mkl_threads", 1)),
+            stack_mem_bytes=int(
+                metadata["system"].get("stack_mem_bytes", 1 << 30)
+            ),
         )
         if solver.fingerprint != metadata["system"]["fingerprint"]:
             raise ValueError(
@@ -735,6 +767,12 @@ class Block2DMRGSolver:
                 else list(self.orbital_symmetries)
             ),
             "target_irrep": self.target_irrep,
+            "symmetry_mode": self.symmetry_mode,
+            "n_mkl_threads": self.n_mkl_threads,
+            "stack_mem_bytes": self.stack_mem_bytes,
+            "restart_dir": (
+                None if self.restart_dir is None else str(self.restart_dir)
+            ),
         }
         run = result.to_dict()
         run["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -1121,7 +1159,7 @@ class Block2DMRGSolver:
         initial_determinants: Sequence[str] | None = None,
         projected_mps_tags: Sequence[str] | None = None,
         projection_weight: float = 10.0,
-    ) -> tuple[float | list[float], float]:
+    ) -> tuple[float | list[float], float, tuple[dict, ...]]:
         self._activate()
         bond_dims, noises, thrds = config.schedule()
         if initial_determinants is not None:
@@ -1162,6 +1200,22 @@ class Block2DMRGSolver:
             twosite_to_onesite=config.twosite_to_onesite,
             iprint=config.iprint,
         )
+        sweep_bond_dims, sweep_dws, sweep_energies = (
+            self.driver.get_dmrg_results()
+        )
+        sweep_history = []
+        for sweep, (bond_dim, discarded_weight, energies) in enumerate(
+            zip(sweep_bond_dims, sweep_dws, sweep_energies)
+        ):
+            values = np.atleast_1d(energies)
+            sweep_history.append(
+                {
+                    "sweep": int(sweep),
+                    "bond_dim": int(bond_dim),
+                    "discarded_weight": float(discarded_weight),
+                    "energies": [float(value) for value in values],
+                }
+            )
         # ``deep_copy`` creates a valid warm-start MPS but does not write the
         # tag-specific info file that ``load_mps`` needs later.  Persist both
         # random and warm-started states in the same format.
@@ -1170,8 +1224,8 @@ class Block2DMRGSolver:
         ket.info.save_data(str(self.store_dir / f"{tag}-mps_info.bin"))
         elapsed = time.perf_counter() - start
         if nroots == 1:
-            return float(energy), elapsed
-        return [float(e) for e in energy], elapsed
+            return float(energy), elapsed, tuple(sweep_history)
+        return [float(e) for e in energy], elapsed, tuple(sweep_history)
 
     def run_ground_state(
         self,
@@ -1180,7 +1234,7 @@ class Block2DMRGSolver:
     ) -> DMRGResult:
         """Solve for the ground state and persist the MPS in the local store."""
         config = config or DMRGConfig()
-        energy, elapsed = self._run_dmrg(
+        energy, elapsed, sweep_history = self._run_dmrg(
             self.hamiltonian_mpo(),
             config,
             config.mps_tag,
@@ -1192,6 +1246,7 @@ class Block2DMRGSolver:
             store_dir=str(self.store_dir),
             config=config,
             elapsed_seconds=elapsed,
+            sweep_history=sweep_history,
         )
         self._record_run(result)
         logger.info(
@@ -1239,7 +1294,7 @@ class Block2DMRGSolver:
         warm_start_available = (
             initial_mps_tag is not None and initial_mps_tag in self.stored_tags()
         )
-        energy, elapsed = self._run_dmrg(
+        energy, elapsed, sweep_history = self._run_dmrg(
             mpo,
             config,
             tag,
@@ -1258,7 +1313,7 @@ class Block2DMRGSolver:
                 "determinant",
                 sector_label,
             )
-            retry_energy, retry_elapsed = self._run_dmrg(
+            retry_energy, retry_elapsed, retry_history = self._run_dmrg(
                 mpo,
                 config,
                 tag,
@@ -1266,6 +1321,7 @@ class Block2DMRGSolver:
             )
             energy = retry_energy
             elapsed += retry_elapsed
+            sweep_history = retry_history
             ket = self.get_mps(tag)
             expectations = self.symmetry_expectations(parity_matrix, ket=ket)
         if not np.allclose(expectations, targets, atol=verify_tol):
@@ -1287,6 +1343,7 @@ class Block2DMRGSolver:
             elapsed_seconds=elapsed,
             sector_label=sector_label,
             symmetry_expectations=tuple(float(x) for x in expectations),
+            sweep_history=sweep_history,
         )
         self._record_run(result)
         return result
@@ -1336,7 +1393,7 @@ class Block2DMRGSolver:
                 if iroot == 0 and base_tag in self.stored_tags()
                 else None
             )
-            _penalized_energy, elapsed = self._run_dmrg(
+            _penalized_energy, elapsed, sweep_history = self._run_dmrg(
                 mpo,
                 root_config,
                 root_tag,
@@ -1365,6 +1422,7 @@ class Block2DMRGSolver:
                 elapsed_seconds=elapsed,
                 sector_label=sector_label,
                 symmetry_expectations=tuple(float(x) for x in expectations),
+                sweep_history=sweep_history,
             ))
 
         results.sort(key=lambda item: item[0])
@@ -1392,11 +1450,11 @@ class Block2DMRGSolver:
         return self.expectation(self.hamiltonian_mpo(), ket=ket)
 
     def spin_resolved_rdms(self, ket=None) -> tuple[np.ndarray, np.ndarray]:
-        """Return conventional spin-resolved 1- and 2-particle RDMs.
+        """Return Block2 conventional one- and two-particle RDMs.
 
-        The returned arrays follow the Block2 SZ conventions documented by
-        ``DMRGDriver.get_conventional_npdm``.  The first axes contain
-        ``(alpha, beta)`` for the 1-RDM and ``(aa, ab, bb)`` for the 2-RDM.
+        In SZ mode the first axes contain ``(alpha, beta)`` for the 1-RDM and
+        ``(aa, ab, bb)`` for the 2-RDM. In SU(2) mode Block2 returns a
+        spin-adapted 1-RDM and the conventional three spin blocks of the 2-RDM.
         """
         if ket is None:
             ket = self.get_mps()
@@ -1592,6 +1650,7 @@ def solve_or_load_ground_state(
             store_dir=str(solver.store_dir),
             config=stored_config,
             elapsed_seconds=float(run["elapsed_seconds"]),
+            sweep_history=tuple(run.get("sweep_history", ())),
         )
     return solver.run_ground_state(config, initial_mps_tag=initial_mps_tag)
 

@@ -155,6 +155,8 @@ class TestBlock2DMRGSolver(unittest.TestCase):
         self.assertAlmostEqual(
             self.result.energy, self.e_exact, delta=ENERGY_TOL
         )
+        self.assertGreater(len(self.result.sweep_history), 0)
+        self.assertIn("discarded_weight", self.result.sweep_history[-1])
 
     def test_spin_resolved_rdms_reproduce_energy(self):
         ket = self.solver.get_mps(self.result.mps_tag)
@@ -346,9 +348,36 @@ class TestBlock2DMRGSolver(unittest.TestCase):
 
         result = solve_or_load_ground_state(reloaded)
         self.assertAlmostEqual(result.energy, self.result.energy, delta=1e-12)
+        self.assertEqual(
+            len(result.sweep_history), len(self.result.sweep_history)
+        )
 
         ci = reloaded.to_ci_vector(reloaded.get_mps("GS"))
         self.assertAlmostEqual(np.linalg.norm(ci), 1.0, places=8)
+
+    def test_su2_mode_matches_exact_singlet_energy(self):
+        store = self.store_root / "su2"
+        solver = Block2DMRGSolver.from_fcidump(
+            FCIDUMP_PATH,
+            store_dir=store,
+            symmetry_mode="su2",
+            n_threads=2,
+        )
+        result = solver.run_ground_state(
+            DMRGConfig(
+                max_bond_dim=40,
+                n_sweeps=4,
+                bond_dims=(20, 30, 40, 40),
+                noises=(1.0e-5, 1.0e-6, 0.0, 0.0),
+                mps_tag="SU2",
+            )
+        )
+        self.assertAlmostEqual(result.energy, self.e_exact, delta=1.0e-7)
+        self.assertEqual(solver.symmetry_mode, "su2")
+        self.assertEqual(
+            Block2DMRGSolver.load(store).symmetry_mode,
+            "su2",
+        )
 
     def test_bipartite_entanglement_shape(self):
         entropies = self.solver.bipartite_entanglement()
