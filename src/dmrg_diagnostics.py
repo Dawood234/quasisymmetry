@@ -103,11 +103,16 @@ def decoupled_energy_dmrg(
     penalty: float = 30.0,
     max_sectors: int = 16,
     chemical_precision: float = CHEMICAL_PRECISION,
+    reference_tag: str = "GS",
 ) -> DecoupledDiagnostic:
     """Scan dominant sectors and return the lowest single-sector energy."""
     parity = prepare_parity_matrix(solver, parity_matrix)
     config = config or DMRGConfig()
-    labels = solver.dominant_sector_labels(parity, max_sectors=max_sectors)
+    labels = solver.dominant_sector_labels(
+        parity,
+        ket=solver.get_mps(reference_tag),
+        max_sectors=max_sectors,
+    )
     if not labels:
         raise RuntimeError("no sector weight found in the reference MPS")
 
@@ -349,7 +354,8 @@ def run_dmrg_metrics(
         solver, config=config, reuse=reuse_ground_state
     )
     parity = prepare_parity_matrix(solver, parity_matrix)
-    expectations = solver.symmetry_expectations(parity)
+    reference_mps = solver.get_mps(gs.mps_tag)
+    expectations = solver.symmetry_expectations(parity, ket=reference_mps)
 
     decoupled = decoupled_energy_dmrg(
         solver,
@@ -359,6 +365,7 @@ def run_dmrg_metrics(
         penalty=penalty,
         max_sectors=max_sectors,
         chemical_precision=chemical_precision,
+        reference_tag=gs.mps_tag,
     )
 
     coupled = None
@@ -390,7 +397,11 @@ def run_dmrg_metrics(
             variational_from_anchor=True,
         )
 
-    ent = entanglement_diagnostic(solver) if compute_entanglement else None
+    ent = (
+        entanglement_diagnostic(solver, ket=reference_mps)
+        if compute_entanglement
+        else None
+    )
     return DMRGMetricsReport(
         e_reference=gs.energy,
         decoupled=decoupled,

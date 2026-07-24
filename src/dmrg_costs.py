@@ -235,9 +235,15 @@ def build_dmrg_orbital_costs(
         )
 
     if rotation is not None:
-        from src.dmrg_solver import rotate_integrals
+        from src.dmrg_solver import (
+            rotate_integrals,
+            rotation_preserves_orbital_symmetries,
+        )
 
         h1e, g2e = rotate_integrals(solver.h1e, solver.g2e, rotation)
+        preserve_point_group = rotation_preserves_orbital_symmetries(
+            rotation, solver.orbital_symmetries
+        )
         solver = Block2DMRGSolver(
             h1e=h1e,
             g2e=g2e,
@@ -246,6 +252,10 @@ def build_dmrg_orbital_costs(
             spin=solver.spin,
             store_dir=store_dir or solver.store_dir,
             n_threads=n_threads,
+            orbital_symmetries=(
+                solver.orbital_symmetries if preserve_point_group else None
+            ),
+            target_irrep=solver.target_irrep,
         )
 
     result = solve_or_load_ground_state(solver, config=config, reuse=reuse)

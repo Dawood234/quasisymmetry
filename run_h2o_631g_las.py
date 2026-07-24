@@ -260,10 +260,18 @@ def optimize_command(args, checkpoint, parity, rotation, cycle_dir, parent_store
         str(args.reference_bond_dim),
         "--reference_sweeps",
         str(args.reference_sweeps),
+        "--reference_energy_tol",
+        str(args.reference_energy_tol),
+        "--reference_davidson_threshold",
+        str(args.reference_davidson_threshold),
         "--sector_bond_dim",
         str(args.sector_bond_dim),
         "--sector_sweeps",
         str(args.sector_sweeps),
+        "--sector_energy_tol",
+        str(args.sector_energy_tol),
+        "--sector_davidson_threshold",
+        str(args.sector_davidson_threshold),
         "--sector_penalty",
         str(args.sector_penalty),
         "--sector_gradient",
@@ -287,6 +295,16 @@ def optimize_command(args, checkpoint, parity, rotation, cycle_dir, parent_store
         "--outname",
         str(output),
     ]
+    if args.reference_twosite_to_onesite is not None:
+        command.extend([
+            "--reference_twosite_to_onesite",
+            str(args.reference_twosite_to_onesite),
+        ])
+    if args.sector_twosite_to_onesite is not None:
+        command.extend([
+            "--sector_twosite_to_onesite",
+            str(args.sector_twosite_to_onesite),
+        ])
     if rotation is not None:
         command.extend(["--x0", str(rotation)])
     if resume and restart.exists():
@@ -395,8 +413,18 @@ def parse_args():
     parser.add_argument("--max_macrocycles", type=int, default=3)
     parser.add_argument("--reference_bond_dim", type=int, default=150)
     parser.add_argument("--reference_sweeps", type=int, default=8)
+    parser.add_argument("--reference_energy_tol", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--reference_davidson_threshold", type=float, default=1.0e-8
+    )
+    parser.add_argument("--reference_twosite_to_onesite", type=int, default=4)
     parser.add_argument("--sector_bond_dim", type=int, default=100)
     parser.add_argument("--sector_sweeps", type=int, default=6)
+    parser.add_argument("--sector_energy_tol", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--sector_davidson_threshold", type=float, default=1.0e-8
+    )
+    parser.add_argument("--sector_twosite_to_onesite", type=int, default=4)
     parser.add_argument("--sector_penalty", type=float, default=30.0)
     parser.add_argument(
         "--sector_gradient",
@@ -411,6 +439,12 @@ def parse_args():
     parser.add_argument("--multiply_sweeps", type=int, default=4)
     parser.add_argument("--final_bond_dims", default="350,500")
     parser.add_argument("--final_sweeps", type=int, default=20)
+    parser.add_argument("--final_energy_tol", type=float, default=1.0e-8)
+    parser.add_argument(
+        "--final_davidson_threshold", type=float, default=1.0e-10
+    )
+    parser.add_argument("--final_twosite_to_onesite", type=int, default=12)
+    parser.add_argument("--final_dmrg_iprint", type=int, default=1)
     parser.add_argument("--roots_per_sector", type=int, default=5)
     parser.add_argument("--max_roots_per_sector", type=int, default=20)
     parser.add_argument("--root_batch_size", type=int, default=5)
@@ -437,13 +471,16 @@ def main():
     if args.smoke:
         args.reference_bond_dim = 50
         args.reference_sweeps = 2
+        args.reference_twosite_to_onesite = 1
         args.sector_bond_dim = 50
         args.sector_sweeps = 2
+        args.sector_twosite_to_onesite = 1
         args.optimizer_maxiter = 1
         args.sector_switch_maxiter = 0
         args.max_macrocycles = 1
         args.final_bond_dims = "35,50"
         args.final_sweeps = 2
+        args.final_twosite_to_onesite = 1
         args.multiply_bond_dim = 50
         args.multiply_sweeps = 2
 
@@ -510,6 +547,14 @@ def main():
             str(args.reference_bond_dim),
             "--n_sweeps",
             str(args.reference_sweeps),
+            "--energy_tol",
+            str(args.reference_energy_tol),
+            "--davidson_threshold",
+            str(args.reference_davidson_threshold),
+            "--twosite_to_onesite",
+            str(args.reference_twosite_to_onesite),
+            "--dmrg_iprint",
+            "1",
             "--n_threads",
             str(args.cpus),
             "--store_dir",
@@ -652,6 +697,14 @@ def main():
                 str(bond),
                 "--n_sweeps",
                 str(args.final_sweeps),
+                "--energy_tol",
+                str(args.final_energy_tol),
+                "--davidson_threshold",
+                str(args.final_davidson_threshold),
+                "--twosite_to_onesite",
+                str(args.final_twosite_to_onesite),
+                "--dmrg_iprint",
+                str(args.final_dmrg_iprint),
                 "--n_threads",
                 str(args.cpus),
                 "--store_dir",

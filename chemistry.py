@@ -53,6 +53,10 @@ def fcidump_data(molpath):
         dumpdata["H1"] = h1
         dumpdata["H2"] = pyscf.ao2mo.full(mol, mo_coeff)
         dumpdata["ECORE"] = mol.energy_nuc()
+        if mol.symmetry and hasattr(scf, "get_orbsym"):
+            dumpdata["ORBSYM"] = np.asarray(scf.get_orbsym(), dtype=int)
+            dumpdata["PG_IRREP"] = int(scf.get_wfnsym())
+            dumpdata["POINT_GROUP"] = str(mol.groupname)
         return dumpdata
     else:
         raise ValueError(".chk or .FCIDUMP")

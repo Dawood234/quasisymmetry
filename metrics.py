@@ -230,6 +230,7 @@ def _run_dmrg_from_oo_json(input_data, args, outname, out_data):
     from src.dmrg_solver import (
         Block2DMRGSolver,
         DMRGConfig,
+        rotation_preserves_orbital_symmetries,
         rotate_integrals,
     )
 
@@ -254,15 +255,21 @@ def _run_dmrg_from_oo_json(input_data, args, outname, out_data):
         )
     h1e, g2e, ecore = base.h1e, base.g2e, base.ecore
     n_elec, spin = base.n_elec, base.spin
+    orbital_symmetries = base.orbital_symmetries
 
     rotation = np.asarray(input_data.get("rotation", []), dtype=float)
     if rotation.size:
         from src.orbital_rotation import pairs_from_oo_data, params_to_U
 
         pairs = pairs_from_oo_data(input_data, h1e.shape[0])
+        rotation_matrix = params_to_U(rotation, h1e.shape[0], pairs)
         h1e, g2e = rotate_integrals(
-            h1e, g2e, params_to_U(rotation, h1e.shape[0], pairs)
+            h1e, g2e, rotation_matrix
         )
+        if not rotation_preserves_orbital_symmetries(
+            rotation_matrix, orbital_symmetries
+        ):
+            orbital_symmetries = None
 
     solver = Block2DMRGSolver(
         h1e=h1e,
@@ -273,6 +280,8 @@ def _run_dmrg_from_oo_json(input_data, args, outname, out_data):
         store_dir=store_dir,
         n_threads=args.n_threads,
         reorder=args.reorder,
+        orbital_symmetries=orbital_symmetries,
+        target_irrep=base.target_irrep,
     )
     states_per_sector = (
         args.states_per_sector if args.states_per_sector < 50 else 5

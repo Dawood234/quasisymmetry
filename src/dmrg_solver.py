@@ -189,6 +189,8 @@ def find_sector_determinants(
     n_elec: int,
     spin: int,
     maximum: int = 32,
+    orbital_symmetries: Sequence[int] | None = None,
+    target_irrep: int = 0,
 ) -> list[str]:
     """Find a small fixed-spin determinant seed in one parity sector.
 
@@ -210,8 +212,14 @@ def find_sector_determinants(
 
     n_alpha = (int(n_elec) + int(spin)) // 2
     n_beta = int(n_elec) - n_alpha
+    if orbital_symmetries is not None:
+        orbital_symmetries = tuple(int(value) for value in orbital_symmetries)
+        if len(orbital_symmetries) != norb:
+            raise ValueError(
+                "orbital_symmetries must have one label per spatial orbital"
+            )
     zero_parity = tuple(0 for _ in label)
-    stack = [(0, 0, 0, zero_parity, "")]
+    stack = [(0, 0, 0, zero_parity, 0, "")]
     local_states = (
         (1, 1, "2"),
         (1, 0, "a"),
@@ -221,9 +229,17 @@ def find_sector_determinants(
     determinants = []
 
     while stack and len(determinants) < int(maximum):
-        orbital, used_alpha, used_beta, parity, symbols = stack.pop()
+        orbital, used_alpha, used_beta, parity, irrep, symbols = stack.pop()
         if orbital == norb:
-            if used_alpha == n_alpha and used_beta == n_beta and parity == label:
+            if (
+                used_alpha == n_alpha
+                and used_beta == n_beta
+                and parity == label
+                and (
+                    orbital_symmetries is None
+                    or irrep == int(target_irrep)
+                )
+            ):
                 determinants.append(symbols)
             continue
 
@@ -245,8 +261,21 @@ def find_sector_determinants(
                 )
                 for k in range(len(label))
             )
+            next_irrep = irrep
+            if orbital_symmetries is not None:
+                if add_alpha:
+                    next_irrep ^= orbital_symmetries[orbital]
+                if add_beta:
+                    next_irrep ^= orbital_symmetries[orbital]
             stack.append(
-                (orbital + 1, next_alpha, next_beta, next_parity, symbols + symbol)
+                (
+                    orbital + 1,
+                    next_alpha,
+                    next_beta,
+                    next_parity,
+                    next_irrep,
+                    symbols + symbol,
+                )
             )
 
     if not determinants:
@@ -263,10 +292,19 @@ def find_sector_determinant(
     norb: int,
     n_elec: int,
     spin: int,
+    orbital_symmetries: Sequence[int] | None = None,
+    target_irrep: int = 0,
 ) -> str:
     """Return one determinant in a requested fixed-spin parity sector."""
     return find_sector_determinants(
-        parity_matrix, sector_label, norb, n_elec, spin, maximum=1
+        parity_matrix,
+        sector_label,
+        norb,
+        n_elec,
+        spin,
+        maximum=1,
+        orbital_symmetries=orbital_symmetries,
+        target_irrep=target_irrep,
     )[0]
 
 
@@ -281,6 +319,8 @@ class DMRGConfig:
     mps_tag: str = "GS"
     bond_dims: tuple[int, ...] = field(default=())
     noises: tuple[float, ...] = field(default=())
+    twosite_to_onesite: int | None = None
+    iprint: int = 0
 
     def schedule(self) -> tuple[list[int], list[float], list[float]]:
         """Return (bond_dims, noises, davidson thresholds) per sweep."""
@@ -367,6 +407,33 @@ def permute_integrals(
     return h1e_p, g2e_p
 
 
+def permute_orbital_symmetries(
+    orbital_symmetries: Sequence[int], permutation: Sequence[int]
+) -> tuple[int, ...]:
+    """Apply an orbital permutation to Abelian point-group labels."""
+    labels = np.asarray(orbital_symmetries, dtype=int)
+    perm = np.asarray(permutation, dtype=int)
+    if labels.shape != perm.shape:
+        raise ValueError("orbital symmetry labels must have one entry per orbital")
+    return tuple(int(value) for value in labels[perm])
+
+
+def rotation_preserves_orbital_symmetries(
+    rotation: np.ndarray,
+    orbital_symmetries: Sequence[int] | None,
+    tolerance: float = 1.0e-10,
+) -> bool:
+    """Return whether a rotation mixes only orbitals in the same irrep."""
+    if orbital_symmetries is None:
+        return False
+    rotation = np.asarray(rotation)
+    labels = np.asarray(orbital_symmetries, dtype=int)
+    if rotation.shape != (len(labels), len(labels)):
+        raise ValueError("rotation and orbital symmetry labels have different sizes")
+    different_irrep = labels[:, None] != labels[None, :]
+    return bool(np.max(np.abs(rotation[different_irrep]), initial=0.0) <= tolerance)
+
+
 class Block2DMRGSolver:
     """Fermionic (SZ-mode) block2 DMRG solver with local wavefunction storage.
 
@@ -387,12 +454,20 @@ class Block2DMRGSolver:
         save_integrals: bool = True,
         orbital_permutation: Sequence[int] | None = None,
         reorder: str | None = None,
+        orbital_symmetries: Sequence[int] | None = None,
+        target_irrep: int = 0,
     ) -> None:
         _require_pyblock2()
         h1e = np.ascontiguousarray(h1e, dtype=np.float64)
         g2e = np.ascontiguousarray(g2e, dtype=np.float64)
         self.ecore = float(ecore)
         n_sites = int(h1e.shape[0])
+        if orbital_symmetries is not None:
+            orbital_symmetries = tuple(int(value) for value in orbital_symmetries)
+            if len(orbital_symmetries) != n_sites:
+                raise ValueError(
+                    "orbital_symmetries must have one label per spatial orbital"
+                )
 
         if reorder is not None and orbital_permutation is not None:
             raise ValueError("pass at most one of reorder= and orbital_permutation=")
@@ -401,6 +476,10 @@ class Block2DMRGSolver:
                 h1e, g2e, method=reorder
             )
             h1e, g2e = permute_integrals(h1e, g2e, orbital_permutation)
+            if orbital_symmetries is not None:
+                orbital_symmetries = permute_orbital_symmetries(
+                    orbital_symmetries, orbital_permutation
+                )
         if orbital_permutation is None:
             orbital_permutation = tuple(range(n_sites))
         else:
@@ -411,6 +490,8 @@ class Block2DMRGSolver:
         self.n_sites = int(self.h1e.shape[0])
         self.n_elec, self.spin = normalize_nelec(n_elec, spin)
         self.orbital_permutation = orbital_permutation
+        self.orbital_symmetries = orbital_symmetries
+        self.target_irrep = int(target_irrep)
         self.fingerprint = _integral_fingerprint(self.h1e, self.g2e, self.ecore)
 
         if store_dir is None:
@@ -471,7 +552,17 @@ class Block2DMRGSolver:
             n_threads=self.n_threads,
         )
         self.driver.initialize_system(
-            n_sites=self.n_sites, n_elec=self.n_elec, spin=self.spin
+            n_sites=self.n_sites,
+            n_elec=self.n_elec,
+            spin=self.spin,
+            pg_irrep=(
+                self.target_irrep if self.orbital_symmetries is not None else None
+            ),
+            orb_sym=(
+                list(self.orbital_symmetries)
+                if self.orbital_symmetries is not None
+                else None
+            ),
         )
         self._hamiltonian_mpo = None
         _ACTIVE_SOLVER = self
@@ -486,6 +577,7 @@ class Block2DMRGSolver:
         fcidump_path: str | Path,
         store_dir: str | Path | None = None,
         n_threads: int = 4,
+        point_group: str = "c1",
         **kwargs,
     ) -> "Block2DMRGSolver":
         """Build a solver directly from an FCIDUMP file (no pyscf needed)."""
@@ -495,12 +587,18 @@ class Block2DMRGSolver:
             reader = DMRGDriver(
                 scratch=tmp_scratch, symm_type=SymmetryTypes.SZ, n_threads=1
             )
-            reader.read_fcidump(str(fcidump_path), pg="c1", iprint=0)
+            reader.read_fcidump(str(fcidump_path), pg=point_group, iprint=0)
             h1e = np.array(reader.h1e)
             g2e = np.array(reader.g2e)
             ecore = float(reader.ecore)
             n_elec = int(reader.n_elec)
             spin = int(reader.spin)
+            orbital_symmetries = (
+                None
+                if point_group.lower() == "c1"
+                else tuple(int(value) for value in reader.orb_sym)
+            )
+            target_irrep = int(getattr(reader, "pg_irrep", 0))
         finally:
             shutil.rmtree(tmp_scratch, ignore_errors=True)
         return cls(
@@ -511,6 +609,8 @@ class Block2DMRGSolver:
             spin=spin,
             store_dir=store_dir,
             n_threads=n_threads,
+            orbital_symmetries=orbital_symmetries,
+            target_irrep=target_irrep,
             **kwargs,
         )
 
@@ -526,6 +626,10 @@ class Block2DMRGSolver:
         n_elec, spin = normalize_nelec(
             dumpdata["NELEC"], dumpdata.get("MS2", 0)
         )
+        solver_kwargs = dict(kwargs)
+        if dumpdata.get("POINT_GROUP") is not None:
+            solver_kwargs.setdefault("orbital_symmetries", dumpdata.get("ORBSYM"))
+            solver_kwargs.setdefault("target_irrep", dumpdata.get("PG_IRREP", 0))
         return cls(
             h1e=np.asarray(dumpdata["H1"]),
             g2e=np.asarray(dumpdata["H2"]),
@@ -534,7 +638,7 @@ class Block2DMRGSolver:
             spin=spin,
             store_dir=store_dir,
             n_threads=n_threads,
-            **kwargs,
+            **solver_kwargs,
         )
 
     @classmethod
@@ -558,6 +662,11 @@ class Block2DMRGSolver:
         perm = None
         if "orbital_permutation" in data.files:
             perm = tuple(int(p) for p in data["orbital_permutation"])
+        orbital_symmetries = None
+        if "orbital_symmetries" in data.files:
+            stored_labels = np.asarray(data["orbital_symmetries"], dtype=int)
+            if stored_labels.size:
+                orbital_symmetries = tuple(int(value) for value in stored_labels)
         solver = cls(
             h1e=data["h1e"],
             g2e=data["g2e"],
@@ -568,6 +677,8 @@ class Block2DMRGSolver:
             n_threads=n_threads or int(metadata["system"].get("n_threads", 4)),
             save_integrals=False,
             orbital_permutation=perm,
+            orbital_symmetries=orbital_symmetries,
+            target_irrep=int(metadata["system"].get("target_irrep", 0)),
         )
         if solver.fingerprint != metadata["system"]["fingerprint"]:
             raise ValueError(
@@ -597,6 +708,12 @@ class Block2DMRGSolver:
             g2e=self.g2e,
             ecore=self.ecore,
             orbital_permutation=np.asarray(self.orbital_permutation, dtype=int),
+            orbital_symmetries=np.asarray(
+                self.orbital_symmetries
+                if self.orbital_symmetries is not None
+                else (),
+                dtype=int,
+            ),
         )
 
     def _record_run(self, result: DMRGResult) -> None:
@@ -612,6 +729,12 @@ class Block2DMRGSolver:
             "fingerprint": self.fingerprint,
             "n_threads": self.n_threads,
             "orbital_permutation": list(self.orbital_permutation),
+            "orbital_symmetries": (
+                None
+                if self.orbital_symmetries is None
+                else list(self.orbital_symmetries)
+            ),
+            "target_irrep": self.target_irrep,
         }
         run = result.to_dict()
         run["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -1036,7 +1159,8 @@ class Block2DMRGSolver:
                 [float(projection_weight)] * len(projected_mps)
                 if projected_mps else None
             ),
-            iprint=0,
+            twosite_to_onesite=config.twosite_to_onesite,
+            iprint=config.iprint,
         )
         # ``deep_copy`` creates a valid warm-start MPS but does not write the
         # tag-specific info file that ``load_mps`` needs later.  Persist both
@@ -1049,11 +1173,18 @@ class Block2DMRGSolver:
             return float(energy), elapsed
         return [float(e) for e in energy], elapsed
 
-    def run_ground_state(self, config: DMRGConfig | None = None) -> DMRGResult:
+    def run_ground_state(
+        self,
+        config: DMRGConfig | None = None,
+        initial_mps_tag: str | None = None,
+    ) -> DMRGResult:
         """Solve for the ground state and persist the MPS in the local store."""
         config = config or DMRGConfig()
         energy, elapsed = self._run_dmrg(
-            self.hamiltonian_mpo(), config, config.mps_tag
+            self.hamiltonian_mpo(),
+            config,
+            config.mps_tag,
+            initial_mps_tag=initial_mps_tag,
         )
         result = DMRGResult(
             energy=energy,
@@ -1102,6 +1233,8 @@ class Block2DMRGSolver:
             self.n_elec,
             self.spin,
             maximum=32,
+            orbital_symmetries=self.orbital_symmetries,
+            target_irrep=self.target_irrep,
         )
         warm_start_available = (
             initial_mps_tag is not None and initial_mps_tag in self.stored_tags()
@@ -1187,6 +1320,8 @@ class Block2DMRGSolver:
             self.n_elec,
             self.spin,
             maximum=max(32, 4 * int(nroots)),
+            orbital_symmetries=self.orbital_symmetries,
+            target_irrep=self.target_irrep,
         )
         targets = np.array([(-1.0) ** b for b in sector_label])
         results: list[tuple[float, str]] = []
@@ -1437,6 +1572,7 @@ def solve_or_load_ground_state(
     solver: Block2DMRGSolver,
     config: DMRGConfig | None = None,
     reuse: bool = True,
+    initial_mps_tag: str | None = None,
 ) -> DMRGResult:
     """Return the stored ground-state result if present, else solve and store."""
     config = config or DMRGConfig()
@@ -1457,7 +1593,7 @@ def solve_or_load_ground_state(
             config=stored_config,
             elapsed_seconds=float(run["elapsed_seconds"]),
         )
-    return solver.run_ground_state(config)
+    return solver.run_ground_state(config, initial_mps_tag=initial_mps_tag)
 
 
 def get_dmrg_reference(

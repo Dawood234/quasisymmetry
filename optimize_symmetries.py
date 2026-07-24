@@ -588,6 +588,20 @@ if __name__=="__main__":
     parser.add_argument("--sector_bond_dim", type=int, default=100)
     parser.add_argument("--sector_sweeps", type=int, default=6)
     parser.add_argument("--sector_penalty", type=float, default=30.0)
+    parser.add_argument("--sector_energy_tol", type=float, default=1.0e-6)
+    parser.add_argument("--sector_davidson_threshold", type=float, default=1.0e-8)
+    parser.add_argument(
+        "--sector_twosite_to_onesite",
+        type=int,
+        default=None,
+        help="initial 2-site sweeps before switching low-fidelity sector solves to 1-site",
+    )
+    parser.add_argument(
+        "--sector_dmrg_iprint",
+        type=int,
+        default=0,
+        help="Block2 verbosity for switching-sector objective solves",
+    )
     parser.add_argument(
         "--sector_gradient",
         choices=("analytic", "finite_difference"),
@@ -605,6 +619,16 @@ if __name__=="__main__":
         default=20,
         help="sweeps used to prepare the parent DMRG reference",
     )
+    parser.add_argument("--reference_energy_tol", type=float, default=1.0e-8)
+    parser.add_argument(
+        "--reference_davidson_threshold", type=float, default=1.0e-10
+    )
+    parser.add_argument(
+        "--reference_twosite_to_onesite",
+        type=int,
+        default=None,
+    )
+    parser.add_argument("--reference_dmrg_iprint", type=int, default=0)
     parser.add_argument(
         "--objective_store",
         default=None,
@@ -684,6 +708,10 @@ if __name__=="__main__":
             config=DMRGConfig(
                 max_bond_dim=args.bond_dim,
                 n_sweeps=args.reference_sweeps,
+                energy_tol=args.reference_energy_tol,
+                davidson_threshold=args.reference_davidson_threshold,
+                twosite_to_onesite=args.reference_twosite_to_onesite,
+                iprint=args.reference_dmrg_iprint,
             ),
             multiply=MultiplyConfig(
                 bond_dim=args.multiply_bond_dim,
@@ -788,6 +816,10 @@ if __name__=="__main__":
                         max_bond_dim=args.bond_dim,
                         n_sweeps=args.reference_sweeps,
                         mps_tag=screening_tag,
+                        energy_tol=args.reference_energy_tol,
+                        davidson_threshold=args.reference_davidson_threshold,
+                        twosite_to_onesite=args.reference_twosite_to_onesite,
+                        iprint=args.reference_dmrg_iprint,
                     ),
                     reuse=True,
                 )
@@ -815,6 +847,10 @@ if __name__=="__main__":
                 sweeps=args.sector_sweeps,
                 penalty=args.sector_penalty,
                 n_threads=args.n_threads,
+                energy_tol=args.sector_energy_tol,
+                davidson_threshold=args.sector_davidson_threshold,
+                twosite_to_onesite=args.sector_twosite_to_onesite,
+                dmrg_iprint=args.sector_dmrg_iprint,
                 cleanup_mps=not args.no_cleanup_optimizer_mps,
             )
             t_start = time.time()

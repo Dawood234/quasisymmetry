@@ -40,10 +40,21 @@ from src.dmrg_diagnostics import (
 from src.dmrg_solver import (
     Block2DMRGSolver,
     DMRGConfig,
+    rotation_preserves_orbital_symmetries,
     rotate_integrals,
     solve_or_load_ground_state,
 )
 from src.workflow_cli import add_orbital_rotation_arg
+
+
+def comma_separated_ints(text: str) -> tuple[int, ...]:
+    """Parse a comma-separated DMRG bond-dimension schedule."""
+    return tuple(int(value) for value in text.split(",") if value.strip())
+
+
+def comma_separated_floats(text: str) -> tuple[float, ...]:
+    """Parse a comma-separated DMRG noise schedule."""
+    return tuple(float(value) for value in text.split(",") if value.strip())
 
 
 def build_solver(args: argparse.Namespace) -> Block2DMRGSolver:
@@ -61,13 +72,21 @@ def build_solver(args: argparse.Namespace) -> Block2DMRGSolver:
         n_elec, spin = base.n_elec, base.spin
     elif molpath.suffix == ".FCIDUMP" or molpath.name.endswith("FCIDUMP"):
         base = Block2DMRGSolver.from_fcidump(
-            molpath, store_dir=None, n_threads=args.n_threads,
+            molpath,
+            store_dir=None,
+            n_threads=args.n_threads,
+            point_group=args.point_group,
             save_integrals=False,
         )
         h1e, g2e, ecore = base.h1e, base.g2e, base.ecore
         n_elec, spin = base.n_elec, base.spin
     else:
         raise ValueError("molpath must be a .chk or FCIDUMP file")
+
+    orbital_symmetries = (
+        None if args.disable_point_group else base.orbital_symmetries
+    )
+    target_irrep = base.target_irrep
 
     suffix = ""
     if args.U is not None:
@@ -79,6 +98,10 @@ def build_solver(args: argparse.Namespace) -> Block2DMRGSolver:
         )
         rotation = params_to_U(x, h1e.shape[0], pairs)
         h1e, g2e = rotate_integrals(h1e, g2e, rotation)
+        if not rotation_preserves_orbital_symmetries(
+            rotation, orbital_symmetries
+        ):
+            orbital_symmetries = None
         x_hash = hashlib.sha256(np.ascontiguousarray(x).tobytes()).hexdigest()[:8]
         suffix = f"_rot-{x_hash}"
     if args.reorder:
@@ -92,6 +115,8 @@ def build_solver(args: argparse.Namespace) -> Block2DMRGSolver:
         h1e=h1e, g2e=g2e, ecore=ecore, n_elec=n_elec, spin=spin,
         store_dir=store_dir, n_threads=args.n_threads,
         reorder=args.reorder,
+        orbital_symmetries=orbital_symmetries,
+        target_irrep=target_irrep,
     )
 
 
@@ -112,6 +137,38 @@ def main() -> None:
                              "(default: wavefunctions/<molname>)")
     parser.add_argument("--bond_dim", type=int, default=250)
     parser.add_argument("--n_sweeps", type=int, default=20)
+    parser.add_argument("--energy_tol", type=float, default=1.0e-8)
+    parser.add_argument("--davidson_threshold", type=float, default=1.0e-10)
+    parser.add_argument(
+        "--bond_dims",
+        type=comma_separated_ints,
+        default=(),
+        help="optional comma-separated bond dimension for every sweep",
+    )
+    parser.add_argument(
+        "--noises",
+        type=comma_separated_floats,
+        default=(),
+        help="optional comma-separated noise schedule",
+    )
+    parser.add_argument(
+        "--twosite_to_onesite",
+        type=int,
+        default=None,
+        help="number of initial 2-site sweeps before switching to 1-site DMRG",
+    )
+    parser.add_argument(
+        "--dmrg_iprint",
+        type=int,
+        default=0,
+        help="Block2 sweep verbosity; use 1 for cluster progress",
+    )
+    parser.add_argument("--mps_tag", default="GS")
+    parser.add_argument(
+        "--initial_mps_tag",
+        default=None,
+        help="warm-start from this tag in the same --store_dir",
+    )
     parser.add_argument("--n_threads", type=int, default=4)
     parser.add_argument("--penalty", type=float, default=30.0,
                         help="sector penalty strength (Hartree)")
@@ -132,6 +189,17 @@ def main() -> None:
     parser.add_argument("--reorder", choices=("fiedler", "gaopt"), default=None,
                         help="reorder orbitals before DMRG (parity matrix is "
                              "remapped automatically)")
+    parser.add_argument(
+        "--point_group",
+        default="c1",
+        help="point group for FCIDUMP orbital labels (e.g. d2h); "
+             "checkpoint files supply this automatically",
+    )
+    parser.add_argument(
+        "--disable_point_group",
+        action="store_true",
+        help="ignore checkpoint/FCIDUMP orbital irreps for a C1 comparison",
+    )
     parser.add_argument("--no_reuse", action="store_true",
                         help="re-solve even if a stored wavefunction exists")
     parser.add_argument("--outname", default=None,
@@ -158,10 +226,32 @@ def main() -> None:
     report(f"store {solver.store_dir}")
     report(f"norb {solver.n_sites} nelec {solver.n_elec} spin {solver.spin}")
     report(f"orbital_permutation {list(solver.orbital_permutation)}")
+    report(
+        "orbital_symmetries "
+        + (
+            "C1"
+            if solver.orbital_symmetries is None
+            else str(list(solver.orbital_symmetries))
+        )
+    )
+    report(f"target_irrep {solver.target_irrep}")
 
-    config = DMRGConfig(max_bond_dim=args.bond_dim, n_sweeps=args.n_sweeps)
+    config = DMRGConfig(
+        max_bond_dim=args.bond_dim,
+        n_sweeps=args.n_sweeps,
+        energy_tol=args.energy_tol,
+        davidson_threshold=args.davidson_threshold,
+        mps_tag=args.mps_tag,
+        bond_dims=args.bond_dims,
+        noises=args.noises,
+        twosite_to_onesite=args.twosite_to_onesite,
+        iprint=args.dmrg_iprint,
+    )
     result = solve_or_load_ground_state(
-        solver, config=config, reuse=not args.no_reuse
+        solver,
+        config=config,
+        reuse=not args.no_reuse,
+        initial_mps_tag=args.initial_mps_tag,
     )
     report(f"E_DMRG {result.energy:.10f} (bond_dim {args.bond_dim})")
 
@@ -169,7 +259,8 @@ def main() -> None:
     if args.parity_matrix is not None:
         parity_matrix = np.atleast_2d(np.loadtxt(args.parity_matrix, dtype=int))
         parity = prepare_parity_matrix(solver, parity_matrix)
-        expectations = solver.symmetry_expectations(parity)
+        reference_mps = solver.get_mps(result.mps_tag)
+        expectations = solver.symmetry_expectations(parity, ket=reference_mps)
         report(f"symmetry expectations <S_k> {np.round(expectations, 6)}")
 
     if args.decoupled:
@@ -180,6 +271,7 @@ def main() -> None:
             config=config,
             penalty=args.penalty,
             max_sectors=args.max_sectors,
+            reference_tag=result.mps_tag,
         )
         for label, energy in decoupled.sector_energies.items():
             report(f"sector {label}: E = {energy:.10f}")
@@ -210,7 +302,9 @@ def main() -> None:
             report("K 1")
 
     if args.entanglement or args.entropies:
-        ent = entanglement_diagnostic(solver)
+        ent = entanglement_diagnostic(
+            solver, ket=solver.get_mps(result.mps_tag)
+        )
         if args.entanglement:
             report(f"bipartite entanglement (nats) {np.round(ent.bipartite, 6)}")
         if args.entropies:

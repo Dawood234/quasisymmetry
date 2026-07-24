@@ -22,6 +22,7 @@ import scipy.optimize
 from src.dmrg_solver import (
     Block2DMRGSolver,
     DMRGConfig,
+    rotation_preserves_orbital_symmetries,
     rotate_integrals,
     restore_g2e,
 )
@@ -146,6 +147,9 @@ def rotated_solver(base_solver, x, pairs, store_dir, n_threads):
     """Build a DMRG solver for the integrals rotated by ``x``."""
     rotation = params_to_U(np.asarray(x, dtype=float), base_solver.n_sites, pairs)
     h1e, g2e = rotate_integrals(base_solver.h1e, base_solver.g2e, rotation)
+    preserve_point_group = rotation_preserves_orbital_symmetries(
+        rotation, base_solver.orbital_symmetries
+    )
     return Block2DMRGSolver(
         h1e=h1e,
         g2e=g2e,
@@ -155,6 +159,10 @@ def rotated_solver(base_solver, x, pairs, store_dir, n_threads):
         store_dir=store_dir,
         n_threads=int(n_threads),
         save_integrals=False,
+        orbital_symmetries=(
+            base_solver.orbital_symmetries if preserve_point_group else None
+        ),
+        target_irrep=base_solver.target_irrep,
     )
 
 
@@ -249,6 +257,8 @@ def evaluate_fixed_sector(context, x, label):
         energy_tol=float(context["energy_tol"]),
         davidson_threshold=float(context["davidson_threshold"]),
         mps_tag=tag,
+        twosite_to_onesite=context["twosite_to_onesite"],
+        iprint=int(context["dmrg_iprint"]),
     )
 
     start = time.perf_counter()
@@ -392,6 +402,8 @@ def make_context(
     n_threads=4,
     energy_tol=1.0e-6,
     davidson_threshold=1.0e-8,
+    twosite_to_onesite=None,
+    dmrg_iprint=0,
     cleanup_mps=True,
 ):
     """Create the dictionary used by the DMRG sector objective."""
@@ -413,6 +425,10 @@ def make_context(
         "n_threads": int(n_threads),
         "energy_tol": float(energy_tol),
         "davidson_threshold": float(davidson_threshold),
+        "twosite_to_onesite": (
+            None if twosite_to_onesite is None else int(twosite_to_onesite)
+        ),
+        "dmrg_iprint": int(dmrg_iprint),
         "cleanup_mps": bool(cleanup_mps),
     }
 
