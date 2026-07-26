@@ -78,14 +78,15 @@ Trillium has separate storage and software from Fir. Transfer the checkpoint,
 proxy MPS, and reference-result artifacts to Trillium before launching, and
 create a Trillium virtual environment rather than copying the Fir environment.
 The Trillium launcher loads `scipy-stack/2026a` and defaults to
-`$HOME/las-env-trillium`.
+`$HOME/las-env-trillium`. It derives the repository root from its own path, so
+it still works when Trillium submits jobs with `--export=NONE`.
 
 Trillium home directories are read-only on compute nodes. Submit from a
 directory under `$SCRATCH` so the relative Slurm output file can be created:
 
 ```bash
 cd "$SCRATCH"
-export LAS_PROJECT_DIR="$HOME/quasisymmetry"
+export LAS_PROJECT_DIR="/home/$USER/links/projects/rrg-izmaylov/$USER/quasisymmetry"
 export LAS_VENV="$HOME/las-env-trillium"
 ```
 

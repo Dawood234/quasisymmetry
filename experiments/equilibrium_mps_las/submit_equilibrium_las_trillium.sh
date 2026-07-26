@@ -23,9 +23,10 @@ fi
 
 module load scipy-stack/2026a
 
-LAS_PROJECT_DIR="${LAS_PROJECT_DIR:-$HOME/quasisymmetry}"
-LAS_VENV="${LAS_VENV:-$HOME/las-env-trillium}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPOSITORY_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+LAS_PROJECT_DIR="${LAS_PROJECT_DIR:-$REPOSITORY_DIR}"
+LAS_VENV="${LAS_VENV:-$HOME/las-env-trillium}"
 TOTAL_THREADS="${SLURM_CPUS_PER_TASK:-192}"
 
 if [[ ! -d "$LAS_PROJECT_DIR" ]]; then
