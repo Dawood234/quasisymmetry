@@ -891,6 +891,27 @@ class Block2DMRGSolver:
         ``density`` is the spatial one-body matrix of ``ñ = U^dagger n_p U``.
         """
         self._activate()
+        if self.symmetry_mode == "su2":
+            if not (alpha and beta):
+                raise ValueError(
+                    "an SU(2) MPS supports spatial occupation parity only; "
+                    "alpha-only or beta-only parity breaks spin symmetry"
+                )
+            # For n = n_alpha + n_beta,
+            # (1 - 2 n_alpha)(1 - 2 n_beta)
+            # = 1 - 2 n + 4 n_alpha n_beta.  A rank-one spatial density D
+            # represents the rotated orbital, and the spin-summed QC operator
+            # with g_ijkl = 4 D_ij D_kl supplies the last term.
+            g2e = 4.0 * np.einsum(
+                "ij,kl->ijkl", density, density, optimize=True
+            )
+            return self.driver.get_qc_mpo(
+                -2.0 * density,
+                g2e,
+                ecore=1.0,
+                iprint=0,
+            )
+
         builder = self.driver.expr_builder()
         builder.add_const(1.0)
         if alpha:
