@@ -23,14 +23,19 @@ fi
 
 module load scipy-stack/2026a
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPOSITORY_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-LAS_PROJECT_DIR="${LAS_PROJECT_DIR:-$REPOSITORY_DIR}"
+SLURM_ACCOUNT="${SLURM_JOB_ACCOUNT:-rrg-izmaylov}"
+DEFAULT_PROJECT_DIR="$HOME/links/projects/$SLURM_ACCOUNT/$USER/quasisymmetry"
+LAS_PROJECT_DIR="${LAS_PROJECT_DIR:-$DEFAULT_PROJECT_DIR}"
 LAS_VENV="${LAS_VENV:-$HOME/las-env-trillium}"
+EXPERIMENT_DIR="$LAS_PROJECT_DIR/experiments/equilibrium_mps_las"
 TOTAL_THREADS="${SLURM_CPUS_PER_TASK:-192}"
 
 if [[ ! -d "$LAS_PROJECT_DIR" ]]; then
     echo "LAS_PROJECT_DIR does not exist: $LAS_PROJECT_DIR" >&2
+    exit 2
+fi
+if [[ ! -f "$EXPERIMENT_DIR/run_equilibrium_las.py" ]]; then
+    echo "Experiment driver does not exist: $EXPERIMENT_DIR/run_equilibrium_las.py" >&2
     exit 2
 fi
 if [[ ! -x "$LAS_VENV/bin/python" ]]; then
@@ -62,9 +67,9 @@ export LAS_PROJECT_DIR
 echo "Host: $(hostname)"
 echo "Started: $(date --iso-8601=seconds)"
 echo "Cluster: Trillium"
-echo "Account: ${SLURM_JOB_ACCOUNT:-rrg-izmaylov}"
+echo "Account: $SLURM_ACCOUNT"
 echo "Project: $LAS_PROJECT_DIR"
-echo "Experiment: $SCRIPT_DIR"
+echo "Experiment: $EXPERIMENT_DIR"
 echo "Submission directory: ${SLURM_SUBMIT_DIR:-$PWD}"
 echo "Scratch: $SCRATCH"
 echo "Python: $LAS_VENV/bin/python"
@@ -84,7 +89,7 @@ print("Python", sys.version.replace("\n", " "))
 PY
 
 srun --ntasks=1 --cpus-per-task="$TOTAL_THREADS" \
-    "$LAS_VENV/bin/python" -u "$SCRIPT_DIR/run_equilibrium_las.py" \
+    "$LAS_VENV/bin/python" -u "$EXPERIMENT_DIR/run_equilibrium_las.py" \
     --project_dir "$LAS_PROJECT_DIR" "${arguments[@]}"
 
 echo
