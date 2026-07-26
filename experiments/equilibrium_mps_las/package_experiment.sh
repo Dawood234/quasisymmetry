@@ -3,6 +3,9 @@
 
 set -euo pipefail
 
+# Prevent macOS tar from adding AppleDouble `._*` metadata entries.
+export COPYFILE_DISABLE=1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DESTINATION="${1:-$SCRIPT_DIR/dist}"
 STAMP="$(date +%Y%m%d_%H%M%S)"

@@ -32,24 +32,69 @@ test.
 
 ## Cluster Bundle
 
-After pulling the branch on the cluster, run directly from this directory:
+The downloaded parent-reference artifacts are stored locally under
+`parent_references/`:
+
+```text
+parent_references/h2o/job_50658575/
+parent_references/n2/job_50805667/
+```
+
+They include the molecular checkpoints, certified reference summaries, and
+reusable Block2 MPS tags. The directory is excluded through `.git/info/exclude`
+because generated wavefunctions must not be committed to the software
+repository.
+
+Code and parent data use separate transfer mechanisms:
+
+```bash
+git pull
+./package_parent_references.sh
+```
+
+`git pull` supplies the tracked experiment code.
+`package_parent_references.sh` creates an artifact-only archive containing
+`parent_references/` and its `SHA256SUMS`. Transfer that archive to Trillium
+with Globus or `scp` and unpack it under `$SCRATCH`. This avoids both code
+duplication and rerunning either parent DMRG calculation.
+
+Run the experiment from the repository directory:
 
 ```bash
 cd ~/quasisymmetry/experiments/equilibrium_mps_las
 ```
 
-Creating a separate bundle is optional. To create one:
+Point `H2O_PARENT` and `N2_PARENT` to the separately extracted artifact tree.
 
-Create the bundle locally:
+## Cluster Launchers
+
+- `submit_equilibrium_las.sh` is the existing Fir launcher. It remains the
+  32-CPU, 64-GiB path used by the current Fir jobs.
+- `submit_equilibrium_las_trillium.sh` is the Trillium launcher. It requests
+  one complete 192-core CPU node under `rrg-izmaylov`; Trillium supplies the
+  node's full memory, so the script does not request a smaller memory slice.
+
+Trillium has separate storage and software from Fir. Transfer the checkpoint,
+proxy MPS, and reference-result artifacts to Trillium before launching, and
+create a Trillium virtual environment rather than copying the Fir environment.
+The Trillium launcher loads `scipy-stack/2026a` and defaults to
+`$HOME/las-env-trillium`.
+
+Trillium home directories are read-only on compute nodes. Submit from a
+directory under `$SCRATCH` so the relative Slurm output file can be created:
 
 ```bash
-./package_experiment.sh
+cd "$SCRATCH"
+export LAS_PROJECT_DIR="$HOME/quasisymmetry"
+export LAS_VENV="$HOME/las-env-trillium"
 ```
 
-Copy and unpack the printed archive on the cluster. The shared project clone
-remains separate and is selected with `LAS_PROJECT_DIR`.
+The Trillium launcher supplies `--threads 192` unless it is explicitly given.
+With `--candidate_workers 10`, candidate scoring uses about 19 threads per
+worker. With `--sector_workers 4`, projector and Krylov work uses 48 threads
+per worker.
 
-## H2O Launch
+## H2O Launch On Fir
 
 ```bash
 export LAS_VENV="$HOME/las-env"
@@ -69,7 +114,27 @@ Use `--sector_workers 1` for the first H2O validation. After that serial path
 passes, resume or launch a fresh matched run with `--sector_workers 4`; each
 worker receives eight threads on the 32-CPU launcher.
 
-## N2 Launch
+## H2O Launch On Trillium
+
+```bash
+PARENT_ROOT="$SCRATCH/alris/equilibrium_mps_parent_references"
+H2O_PARENT="$PARENT_ROOT/parent_references/h2o/job_50658575"
+H2O_RUN="$SCRATCH/alris/quasisymmetry/equilibrium_mps_las/h2o_631g"
+TRILLIUM_LAUNCHER="$LAS_PROJECT_DIR/experiments/equilibrium_mps_las/submit_equilibrium_las_trillium.sh"
+
+sbatch "$TRILLIUM_LAUNCHER" \
+  --system h2o \
+  --checkpoint "$H2O_PARENT/h2o_0.958_104.5_6-31g_c2v.chk" \
+  --proxy_mps "$H2O_PARENT/parent_mps" \
+  --proxy_tag M200 \
+  --reference_result "$H2O_PARENT/parent_reference_summary.json" \
+  --run_dir "$H2O_RUN" \
+  --candidate_workers 10 \
+  --sector_workers 4 \
+  --resume
+```
+
+## N2 Launch On Fir
 
 ```bash
 sbatch submit_equilibrium_las.sh \
@@ -79,6 +144,27 @@ sbatch submit_equilibrium_las.sh \
   --reference_result /scratch/$USER/artifacts/n2_reference.json \
   --h2o_validation_summary /scratch/$USER/alris/equilibrium_mps_las/h2o/summary.json \
   --run_dir /scratch/$USER/alris/equilibrium_mps_las/n2 \
+  --sector_workers 4 \
+  --resume
+```
+
+## N2 Launch On Trillium
+
+Run N2 only after H2O writes a passing `summary.json`:
+
+```bash
+N2_PARENT="$PARENT_ROOT/parent_references/n2/job_50805667"
+N2_RUN="$SCRATCH/alris/quasisymmetry/equilibrium_mps_las/n2_631g"
+
+sbatch "$TRILLIUM_LAUNCHER" \
+  --system n2 \
+  --checkpoint "$N2_PARENT/n2_1.0977_6-31g_d2h.chk" \
+  --proxy_mps "$N2_PARENT/parent_mps" \
+  --proxy_tag M200 \
+  --reference_result "$N2_PARENT/parent_reference_summary.json" \
+  --h2o_validation_summary "$H2O_RUN/summary.json" \
+  --run_dir "$N2_RUN" \
+  --candidate_workers 10 \
   --sector_workers 4 \
   --resume
 ```
