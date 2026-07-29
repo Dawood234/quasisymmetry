@@ -12,7 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.coupled_energy_core import (
     all_sector_eigenpair_candidates,
+    backward_prune_indices,
     build_candidate_hamiltonian,
+    coupled_dimension_from_order,
     find_k_epsilon,
     iterative_pt_from_hamiltonian,
     k_pt_from_ordered_weights,
@@ -211,6 +213,40 @@ class CoupledEnergySanityTests(unittest.TestCase):
         self.assertAlmostEqual(e_dec, 0.0, places=10)
         self.assertEqual(best_key, "A")
         self.assertGreater(e_dec, e_exact)
+
+    def test_backward_prune_removes_decoupled_junk(self):
+        h = np.zeros((4, 4), dtype=np.float64)
+        h[0, 0] = 0.0
+        h[3, 3] = 0.1
+        h[0, 3] = h[3, 0] = 0.2
+        h[1, 1] = 5.0
+        h[2, 2] = 6.0
+        e_ref = float(np.linalg.eigvalsh(h)[0])
+        kept, e_pruned, n_removed = backward_prune_indices(h, 4, e_ref, 1e-10)
+        self.assertEqual(n_removed, 2)
+        self.assertEqual(kept, [0, 3])
+        self.assertAlmostEqual(e_pruned, e_ref, places=10)
+
+    def test_coupled_dimension_backward_prune_reduces_k(self):
+        h = np.zeros((4, 4), dtype=np.float64)
+        h[0, 0] = 0.0
+        h[3, 3] = 0.1
+        h[0, 3] = h[3, 0] = 0.2
+        h[1, 1] = 5.0
+        h[2, 2] = 6.0
+        order = [0, 1, 2, 3]
+        e_ref = float(np.linalg.eigvalsh(h)[0])
+        with_prune = coupled_dimension_from_order(
+            h, order, e_exact=e_ref, tol=1e-10, backward_prune=True
+        )
+        without_prune = coupled_dimension_from_order(
+            h, order, e_exact=e_ref, tol=1e-10, backward_prune=False
+        )
+        self.assertTrue(with_prune.converged)
+        self.assertEqual(without_prune.K, 4)
+        self.assertEqual(with_prune.K_prefix, 4)
+        self.assertEqual(with_prune.K, 2)
+        self.assertAlmostEqual(with_prune.e_coupled, e_ref, places=10)
 
 
 if __name__ == "__main__":

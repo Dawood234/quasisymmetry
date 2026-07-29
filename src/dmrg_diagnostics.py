@@ -130,13 +130,14 @@ def decoupled_energy_dmrg(
             best_energy, best_label = result.energy, label
 
     dE = best_energy - e_reference
+    k_equals_one = abs(dE) < chemical_precision
     return DecoupledDiagnostic(
         e_reference=e_reference,
         e_decoupled=best_energy,
         best_sector=best_label,
         sector_energies=sector_energies,
         dE=dE,
-        k_equals_one=dE < chemical_precision,
+        k_equals_one=k_equals_one,
     )
 
 
@@ -368,12 +369,35 @@ def run_dmrg_metrics(
         reference_tag=gs.mps_tag,
     )
 
+    # Unconstrained DMRG can trap in an excited near-parity sector when the
+    # quasi-symmetries are nearly exact. Sector scan measures bare <H>, so a
+    # lower sector energy is a strictly better variational reference.
+    e_ref = float(gs.energy)
+    ref_ket = solver.get_mps(gs.mps_tag)
+    promoted = False
+    if decoupled.e_decoupled < e_ref - chemical_precision:
+        promoted = True
+        e_ref = float(decoupled.e_decoupled)
+        best_tag = "SECTOR_" + "".join(map(str, decoupled.best_sector))
+        ref_ket = solver.get_mps(best_tag)
+        decoupled = DecoupledDiagnostic(
+            e_reference=e_ref,
+            e_decoupled=decoupled.e_decoupled,
+            best_sector=decoupled.best_sector,
+            sector_energies=decoupled.sector_energies,
+            dE=0.0,
+            k_equals_one=True,
+        )
+
+    if promoted:
+        expectations = solver.symmetry_expectations(parity, ket=ref_ket)
+
     coupled = None
     if compute_k and not decoupled.k_equals_one:
         coupled = coupled_energy_dmrg(
             solver,
             parity_matrix,
-            gs.energy,
+            e_ref,
             decoupled.e_decoupled,
             sector_labels=list(decoupled.sector_energies.keys()),
             nroots=states_per_sector,
@@ -387,7 +411,7 @@ def run_dmrg_metrics(
             k=1,
             converged=True,
             chosen=[(decoupled.best_sector, 0)],
-            e_reference=gs.energy,
+            e_reference=e_ref,
             e_decoupled=decoupled.e_decoupled,
             sector_label_count=len(decoupled.sector_energies),
             candidate_state_count=1,
@@ -398,12 +422,12 @@ def run_dmrg_metrics(
         )
 
     ent = (
-        entanglement_diagnostic(solver, ket=reference_mps)
+        entanglement_diagnostic(solver, ket=ref_ket)
         if compute_entanglement
         else None
     )
     return DMRGMetricsReport(
-        e_reference=gs.energy,
+        e_reference=e_ref,
         decoupled=decoupled,
         coupled=coupled,
         entanglement=ent,

@@ -85,6 +85,7 @@ def coupled_energy_perturbation(
     tau_pt: float = DEFAULT_TAU_PT,
     block_size: int = DEFAULT_BLOCK_SIZE,
     degeneracy_floor: float = COUPLED_ENERGY_DEGENERACY_FLOOR,
+    backward_prune: bool = True,
 ):
     """One-shot PT ordering + nested variational coupled dimension."""
     candidates = all_sector_eigenpair_candidates(sector_data)
@@ -97,6 +98,7 @@ def coupled_energy_perturbation(
         block_size=block_size,
         degeneracy_floor=degeneracy_floor,
         max_total_vectors=max_total_vectors,
+        backward_prune=backward_prune,
     ).as_tuple()
 
 

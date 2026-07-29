@@ -170,6 +170,24 @@ class TestBlock2DMRGSolver(unittest.TestCase):
         )
         self.assertAlmostEqual(energy, self.result.energy, delta=1.0e-7)
 
+    def test_hamiltonian_mpo_includes_ecore(self):
+        """``energy_expectation`` must shift by ``ecore`` when it is removed."""
+        ket = self.solver.get_mps("GS")
+        e_full = self.solver.energy_expectation(ket)
+        saved_ecore = self.solver.ecore
+        saved_mpo = self.solver._hamiltonian_mpo
+        saved_elec = self.solver._electronic_hamiltonian_mpo
+        try:
+            self.solver.ecore = 0.0
+            self.solver._hamiltonian_mpo = None
+            self.solver._electronic_hamiltonian_mpo = None
+            e_no_core = self.solver.energy_expectation(ket)
+        finally:
+            self.solver.ecore = saved_ecore
+            self.solver._hamiltonian_mpo = saved_mpo
+            self.solver._electronic_hamiltonian_mpo = saved_elec
+        self.assertAlmostEqual(e_full - e_no_core, saved_ecore, delta=1e-8)
+
     def test_statevector_matches_exact_ground_state(self):
         psi = self.solver.to_statevector()
         self.assertAlmostEqual(np.linalg.norm(psi), 1.0, places=8)

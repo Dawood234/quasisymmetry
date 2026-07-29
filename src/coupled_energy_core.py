@@ -46,6 +46,7 @@ class CoupledDimensionResult:
     order_indices: list[int] = field(default_factory=list)
     energies: list[float] = field(default_factory=list)
     K_pt: int | None = None
+    K_prefix: int | None = None
     pt_weights: np.ndarray = field(default_factory=lambda: np.asarray([]))
     reference_weights: np.ndarray = field(default_factory=lambda: np.asarray([]))
 
@@ -57,6 +58,7 @@ class CoupledDimensionResult:
             "K": self.K,
             "converged": self.converged,
             "K_pt": self.K_pt,
+            "K_prefix": self.K_prefix,
         }
 
     def as_tuple(
@@ -235,6 +237,52 @@ def find_k_epsilon(
     return k_eps, [energy_at(k) for k in range(1, k_eps + 1)], True
 
 
+def subset_ground_energy(h_ordered: np.ndarray, indices: Sequence[int]) -> float:
+    """Lowest eigenvalue of ``h_ordered`` restricted to ``indices``."""
+    idx = list(indices)
+    if not idx:
+        raise ValueError("indices must be non-empty")
+    if len(idx) == 1:
+        return float(np.real(h_ordered[idx[0], idx[0]]))
+    sub = h_ordered[np.ix_(idx, idx)]
+    return float(np.linalg.eigvalsh(sub)[0])
+
+
+def backward_prune_indices(
+    h_ordered: np.ndarray,
+    prefix_k: int,
+    e_ref: float,
+    tol: float,
+) -> tuple[list[int], float, int]:
+    """Greedy backward removal of individually redundant prefix states.
+
+    For each retained index ``j`` in the leading ``prefix_k`` block, if
+    ``E_{-j} - e_ref <= tol`` then ``j`` is dropped. Repeats until no state
+    is individually removable. Returns kept row/column indices into
+    ``h_ordered``, the pruned ground energy, and the number of states removed.
+    """
+    if prefix_k <= 0:
+        raise ValueError("prefix_k must be positive")
+    active = list(range(prefix_k))
+    if prefix_k == 1:
+        return active, nested_ground_energy(h_ordered, 1), 0
+
+    n_removed = 0
+    changed = True
+    while changed and len(active) > 1:
+        changed = False
+        for drop_pos in range(len(active) - 1, -1, -1):
+            keep = [active[i] for i in range(len(active)) if i != drop_pos]
+            e_minus = subset_ground_energy(h_ordered, keep)
+            if e_minus - e_ref <= tol:
+                active.pop(drop_pos)
+                n_removed += 1
+                changed = True
+                break
+
+    return active, subset_ground_energy(h_ordered, active), n_removed
+
+
 def coupled_dimension_from_order(
     h_coupled: np.ndarray,
     order: Sequence[int],
@@ -248,6 +296,7 @@ def coupled_dimension_from_order(
     pt_weights: np.ndarray | None = None,
     reference_weights: np.ndarray | None = None,
     max_total_vectors: int | None = None,
+    backward_prune: bool = True,
 ) -> CoupledDimensionResult:
     """Nested variational ``K`` along a fixed candidate ordering."""
     order = list(order)
@@ -304,20 +353,30 @@ def coupled_dimension_from_order(
             order_indices=order,
             energies=energies,
             K_pt=k_pt,
+            K_prefix=None,
             pt_weights=np.asarray([]) if pt_weights is None else pt_weights,
             reference_weights=(
                 np.asarray([]) if reference_weights is None else reference_weights
             ),
         )
 
+    k_prefix = k_eps
+    e_coupled = energies[k_eps - 1]
+    chosen_indices = list(range(k_eps))
+    if backward_prune and converged and k_eps > 1:
+        chosen_indices, e_coupled, _n_removed = backward_prune_indices(
+            h_ordered, k_eps, float(e_exact), tol
+        )
+
     return CoupledDimensionResult(
-        e_coupled=energies[k_eps - 1],
-        K=k_eps,
+        e_coupled=e_coupled,
+        K=len(chosen_indices),
         converged=converged,
-        chosen_keys=chosen(k_eps),
+        chosen_keys=[key_list[i] for i in chosen_indices],
         order_indices=order,
         energies=energies,
         K_pt=k_pt,
+        K_prefix=k_prefix,
         pt_weights=np.asarray([]) if pt_weights is None else pt_weights,
         reference_weights=(
             np.asarray([]) if reference_weights is None else reference_weights
@@ -335,6 +394,7 @@ def one_shot_from_hamiltonian(
     degeneracy_floor: float = COUPLED_ENERGY_DEGENERACY_FLOOR,
     keys: Sequence[tuple[object, int]] | None = None,
     max_total_vectors: int | None = None,
+    backward_prune: bool = True,
 ) -> CoupledDimensionResult:
     """One-shot PT ranking + nested variational ``K`` on a candidate Hamiltonian."""
     n = h_coupled.shape[0]
@@ -362,6 +422,7 @@ def one_shot_from_hamiltonian(
         k_pt=k_pt,
         pt_weights=weights,
         max_total_vectors=max_total_vectors,
+        backward_prune=backward_prune,
     )
 
 
@@ -457,6 +518,7 @@ def reference_from_hamiltonian(
     block_size: int = DEFAULT_BLOCK_SIZE,
     keys: Sequence[tuple[object, int]] | None = None,
     max_total_vectors: int | None = None,
+    backward_prune: bool = True,
 ) -> CoupledDimensionResult:
     """Reference-overlap ordering + nested variational ``K``."""
     weights = np.asarray(reference_weights, dtype=np.float64)
@@ -473,6 +535,7 @@ def reference_from_hamiltonian(
         keys=keys,
         reference_weights=weights,
         max_total_vectors=max_total_vectors,
+        backward_prune=backward_prune,
     )
 
 
@@ -486,6 +549,7 @@ def one_shot_coupled_energy(
     block_size: int = DEFAULT_BLOCK_SIZE,
     degeneracy_floor: float = COUPLED_ENERGY_DEGENERACY_FLOOR,
     max_total_vectors: int | None = None,
+    backward_prune: bool = True,
 ) -> CoupledDimensionResult:
     """Dense-vector wrapper around :func:`one_shot_from_hamiltonian`."""
     if not candidates:
@@ -503,6 +567,7 @@ def one_shot_coupled_energy(
         degeneracy_floor=degeneracy_floor,
         keys=keys,
         max_total_vectors=max_total_vectors,
+        backward_prune=backward_prune,
     )
 
 
@@ -515,6 +580,7 @@ def reference_coupled_energy(
     tol: float = CHEMICAL_PRECISION,
     block_size: int = DEFAULT_BLOCK_SIZE,
     max_total_vectors: int | None = None,
+    backward_prune: bool = True,
 ) -> CoupledDimensionResult:
     """Dense-vector wrapper: order by ``|<psi_i|Psi_ref>|^2``, then nested ``K``."""
     if not candidates:
@@ -535,4 +601,5 @@ def reference_coupled_energy(
         block_size=block_size,
         keys=keys,
         max_total_vectors=max_total_vectors,
+        backward_prune=backward_prune,
     )
