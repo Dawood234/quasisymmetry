@@ -24,6 +24,8 @@ from common import (
     validate_artifacts,
 )
 from coupled_workflow import (
+    COUPLED_MATRIX_FILE,
+    COUPLED_SUMMARY_FILE,
     run_anchor_schedule,
     run_residual_adaptive_coupling,
 )
@@ -165,6 +167,21 @@ def add_arguments(parser) -> None:
         "--fit_norm_loss_tolerance",
         type=float,
         default=DEFAULTS["fit_norm_loss_tolerance"],
+    )
+    parser.add_argument(
+        "--projector_absolute_weight_cutoff",
+        type=float,
+        default=DEFAULTS["projector_absolute_weight_cutoff"],
+    )
+    parser.add_argument(
+        "--projector_relative_weight_cutoff",
+        type=float,
+        default=DEFAULTS["projector_relative_weight_cutoff"],
+    )
+    parser.add_argument(
+        "--projector_fit_loss_multiplier",
+        type=float,
+        default=DEFAULTS["projector_fit_loss_multiplier"],
     )
     parser.add_argument(
         "--fit_energy_tolerance_mha",
@@ -805,7 +822,7 @@ def write_summary(args, artifacts, optimized, anchor, coupled, determinant) -> d
         "optimized_json": optimized["path"],
         "anchor_summary": str(args.run_dir / "anchor" / "anchor_summary.json"),
         "coupled_summary": str(
-            args.run_dir / "mps_coupled" / "coupled_summary.json"
+            args.run_dir / "mps_coupled" / COUPLED_SUMMARY_FILE
         ),
         "decoupled_energy": float(anchor["decoupled_energy"]),
         "coupled_energy": float(coupled["coupled_energy"]),
@@ -957,6 +974,13 @@ def main() -> None:
         fit_sweeps=args.fit_sweeps,
         fit_tolerance=args.fit_tolerance,
         fit_norm_loss_tolerance=args.fit_norm_loss_tolerance,
+        projector_absolute_weight_cutoff=(
+            args.projector_absolute_weight_cutoff
+        ),
+        projector_relative_weight_cutoff=(
+            args.projector_relative_weight_cutoff
+        ),
+        projector_fit_loss_multiplier=args.projector_fit_loss_multiplier,
         fit_energy_tolerance_mha=args.fit_energy_tolerance_mha,
         initial_krylov_depth=args.initial_krylov_depth,
         residual_sectors_per_cycle=args.residual_sectors_per_cycle,
@@ -999,10 +1023,12 @@ def main() -> None:
                 optimized["parity_matrix_canonical"], dtype=int
             ),
             symmetry_manifest=optimized["symmetry_manifest"],
-            coupled_summary=args.run_dir / "mps_coupled" / "coupled_summary.json",
+            coupled_summary=args.run_dir
+            / "mps_coupled"
+            / COUPLED_SUMMARY_FILE,
             coupled_matrix_path=args.run_dir
             / "mps_coupled"
-            / "coupled_matrices.npz",
+            / COUPLED_MATRIX_FILE,
             output_dir=args.run_dir / "clifford_lcus",
         )
 

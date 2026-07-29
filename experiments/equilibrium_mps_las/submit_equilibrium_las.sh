@@ -11,6 +11,16 @@
 
 set -euo pipefail
 
+walltime_warning_received=0
+handle_walltime_warning() {
+    walltime_warning_received=1
+    echo
+    echo "[walltime] Slurm sent USR1 at $(date --iso-8601=seconds)."
+    echo "[walltime] The workflow will keep running until the scheduler stops it."
+    echo "[walltime] Atomic candidate and generator checkpoints are safe to reuse with --resume."
+}
+trap handle_walltime_warning USR1
+
 if [[ $# -eq 0 ]]; then
     echo "Pass the run_equilibrium_las.py arguments after the launcher." >&2
     exit 2
@@ -57,7 +67,28 @@ PY
 
 srun --ntasks=1 --cpus-per-task="${SLURM_CPUS_PER_TASK:-32}" \
     "$LAS_VENV/bin/python" -u "$SCRIPT_DIR/run_equilibrium_las.py" \
-    --project_dir "$LAS_PROJECT_DIR" "$@"
+    --project_dir "$LAS_PROJECT_DIR" "$@" &
+workflow_pid=$!
+
+# A trapped signal interrupts wait but not the running srun step. Wait again
+# until the workflow exits or Slurm enforces the actual walltime limit.
+set +e
+while true; do
+    wait "$workflow_pid"
+    workflow_status=$?
+    if kill -0 "$workflow_pid" 2>/dev/null; then
+        continue
+    fi
+    break
+done
+set -e
+
+if [[ "$workflow_status" -ne 0 ]]; then
+    if [[ "$walltime_warning_received" -eq 1 ]]; then
+        echo "[walltime] Workflow stopped after the warning; resubmit the same command with --resume." >&2
+    fi
+    exit "$workflow_status"
+fi
 
 echo
 echo "Finished: $(date --iso-8601=seconds)"

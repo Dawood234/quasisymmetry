@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import json
 import multiprocessing
 import os
 import shutil
@@ -24,6 +25,7 @@ from common import (
 from linear_algebra import (
     coupling_is_allowed,
     hamiltonian_transition_signatures,
+    retain_projector_candidates,
 )
 
 
@@ -66,6 +68,21 @@ def operation_key(*parts) -> str:
 def operation_record(work_dir, tag) -> Path:
     """Metadata path for one completed fitted MPS operation."""
     return Path(work_dir) / "operations" / f"{tag}.json"
+
+
+def operation_record_matches(record, expected) -> bool:
+    """Require exact agreement for every input that defines a fitted MPS."""
+    return bool(record) and all(
+        record.get(key) == value for key, value in expected.items()
+    )
+
+
+def record_fingerprint(record) -> str | None:
+    """Return a canonical fingerprint for one fitted-operation record."""
+    if not record:
+        return None
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def isolated_split_worker(task) -> dict:
@@ -129,6 +146,7 @@ def isolated_sector_chain_worker(task) -> dict:
         bond_dim=int(task["bond_dim"]),
         sweeps=int(task["sweeps"]),
         tolerance=float(task["tolerance"]),
+        tag_prefix=task.get("tag_prefix", "KR"),
     )
     return {
         "store_dir": task["store_dir"],
@@ -154,8 +172,22 @@ def fitted_apply(
 ) -> dict:
     """Fit ``MPO |source>`` and checkpoint the resulting MPS."""
     record_path = operation_record(work_dir, output_tag)
+    expected = {
+        "operation": "fitted_mpo_application",
+        "source_tag": str(source_tag),
+        "output_tag": str(output_tag),
+        "bond_dim": int(bond_dim),
+        "sweeps": int(sweeps),
+        "tolerance": float(tolerance),
+    }
     if mps_tag_exists(solver.store_dir, output_tag) and record_path.exists():
-        return load_json(record_path)
+        saved = load_json(record_path)
+        if operation_record_matches(saved, expected):
+            return saved
+        print(
+            f"[MPS apply] stale record for {output_tag}; recomputing",
+            flush=True,
+        )
     print(
         f"[MPS apply] {source_tag} -> {output_tag}; "
         f"M={bond_dim}, sweeps={sweeps}",
@@ -175,12 +207,7 @@ def fitted_apply(
     persist_mps(solver, output)
     norm2 = solver.mps_norm2(output)
     record = {
-        "operation": "fitted_mpo_application",
-        "source_tag": str(source_tag),
-        "output_tag": str(output_tag),
-        "bond_dim": int(bond_dim),
-        "sweeps": int(sweeps),
-        "tolerance": float(tolerance),
+        **expected,
         "norm2": float(norm2),
         "elapsed_seconds": time.perf_counter() - started,
         "rss_mib": process_rss_mib(),
@@ -203,14 +230,31 @@ def fitted_add(
 ) -> dict:
     """Fit a two-term linear combination and checkpoint it."""
     record_path = operation_record(work_dir, output_tag)
-    if mps_tag_exists(solver.store_dir, output_tag) and record_path.exists():
-        return load_json(record_path)
     coefficients = (
         complex(left_coefficient),
         complex(right_coefficient),
     )
     if any(abs(value.imag) > 1.0e-12 for value in coefficients):
         raise ValueError("the current real Block2 backend requires real coefficients")
+    expected = {
+        "operation": "fitted_mps_addition",
+        "left_tag": str(left_tag),
+        "right_tag": str(right_tag),
+        "left_coefficient": float(coefficients[0].real),
+        "right_coefficient": float(coefficients[1].real),
+        "output_tag": str(output_tag),
+        "bond_dim": int(bond_dim),
+        "sweeps": int(sweeps),
+        "tolerance": float(tolerance),
+    }
+    if mps_tag_exists(solver.store_dir, output_tag) and record_path.exists():
+        saved = load_json(record_path)
+        if operation_record_matches(saved, expected):
+            return saved
+        print(
+            f"[MPS add] stale record for {output_tag}; recomputing",
+            flush=True,
+        )
     print(
         f"[MPS add] {coefficients[0].real:+.6e}*{left_tag} "
         f"{coefficients[1].real:+.6e}*{right_tag} -> {output_tag}",
@@ -237,15 +281,7 @@ def fitted_add(
     persist_mps(solver, target)
     norm2 = solver.mps_norm2(target)
     record = {
-        "operation": "fitted_mps_addition",
-        "left_tag": str(left_tag),
-        "right_tag": str(right_tag),
-        "left_coefficient": float(coefficients[0].real),
-        "right_coefficient": float(coefficients[1].real),
-        "output_tag": str(output_tag),
-        "bond_dim": int(bond_dim),
-        "sweeps": int(sweeps),
-        "tolerance": float(tolerance),
+        **expected,
         "norm2": float(norm2),
         "elapsed_seconds": time.perf_counter() - started,
         "rss_mib": process_rss_mib(),
@@ -603,18 +639,50 @@ def projector_beam_split(
     worker_root=None,
     workers=1,
     total_threads=1,
+    protected_label=None,
 ) -> dict:
     """Recursively resolve an MPS into selected joint parity sectors."""
     parity = np.atleast_2d(np.asarray(parity_matrix, dtype=int))
     work_dir = Path(work_dir)
+    source = solver.get_mps(source_tag)
+    source_norm2 = solver.mps_norm2(source)
+    source_record_fingerprint = record_fingerprint(
+        load_json(operation_record(work_dir, source_tag), {})
+    )
     result_path = work_dir / f"{prefix}_projector_result.json"
     if result_path.exists():
         saved = load_json(result_path)
-        if all(mps_tag_exists(solver.store_dir, item["tag"]) for item in saved["branches"]):
+        protected_present = (
+            protected_label is None
+            or any(
+                tuple(item["label"]) == tuple(protected_label)
+                for item in saved.get("branches", [])
+            )
+        )
+        compatible = (
+            saved.get("source_tag") == source_tag
+            and int(saved.get("beam_width", -1)) == int(beam_width)
+            and int(saved.get("bond_dim", -1)) == int(bond_dim)
+            and len(saved.get("levels", [])) == len(parity)
+            and protected_present
+            and np.isclose(
+                float(saved.get("source_norm2", np.nan)),
+                float(source_norm2),
+                rtol=1.0e-12,
+                atol=1.0e-14,
+            )
+            and (
+                saved.get("source_record_fingerprint") is None
+                or saved.get("source_record_fingerprint")
+                == source_record_fingerprint
+            )
+        )
+        if compatible and all(
+            mps_tag_exists(solver.store_dir, item["tag"])
+            for item in saved["branches"]
+        ):
             print(f"[projector] reusing {result_path}", flush=True)
             return saved
-    source = solver.get_mps(source_tag)
-    source_norm2 = solver.mps_norm2(source)
     branches = [{"label": (), "tag": source_tag, "norm2": source_norm2}]
     discarded_beam_weight = 0.0
     compression_loss = 0.0
@@ -647,9 +715,16 @@ def projector_beam_split(
         split_norm = sum(float(item["norm2"]) for item in candidates)
         level_loss = max(0.0, parent_norm - split_norm)
         compression_loss += level_loss
-        candidates.sort(key=lambda item: -float(item["norm2"]))
-        kept = candidates[: int(beam_width)]
-        pruned = candidates[int(beam_width) :]
+        protected_prefix = (
+            None
+            if protected_label is None
+            else tuple(int(bit) for bit in protected_label[:level])
+        )
+        kept, pruned = retain_projector_candidates(
+            candidates,
+            beam_width,
+            protected_prefix=protected_prefix,
+        )
         pruned_weight = sum(float(item["norm2"]) for item in pruned)
         discarded_beam_weight += pruned_weight
         branches = kept
@@ -662,6 +737,18 @@ def projector_beam_split(
             "pruned_weight": pruned_weight,
             "retained_count": len(kept),
             "retained_weight": sum(float(item["norm2"]) for item in kept),
+            "protected_prefix": (
+                None
+                if protected_prefix is None
+                else list(protected_prefix)
+            ),
+            "protected_prefix_retained": (
+                None
+                if protected_prefix is None
+                else any(
+                    tuple(item["label"]) == protected_prefix for item in kept
+                )
+            ),
         }
         levels.append(level_record)
         atomic_json(work_dir / f"{prefix}_projector_level_{level}.json", {
@@ -677,6 +764,7 @@ def projector_beam_split(
     result = {
         "source_tag": source_tag,
         "source_norm2": source_norm2,
+        "source_record_fingerprint": source_record_fingerprint,
         "branches": branches,
         "retained_weight": sum(float(item["norm2"]) for item in branches),
         "discarded_beam_weight": discarded_beam_weight,
@@ -684,6 +772,11 @@ def projector_beam_split(
         "levels": levels,
         "beam_width": int(beam_width),
         "bond_dim": int(bond_dim),
+        "protected_label": (
+            None
+            if protected_label is None
+            else [int(bit) for bit in protected_label]
+        ),
     }
     atomic_json(result_path, result)
     return result
@@ -773,6 +866,7 @@ def extend_sector_chain(
     sweeps,
     tolerance,
     dependence_tolerance=1.0e-10,
+    tag_prefix="KR",
 ) -> list[dict]:
     """Add a residual seed and sector-local $H_dec$ Krylov actions."""
     label = tuple(int(bit) for bit in label)
@@ -784,7 +878,7 @@ def extend_sector_chain(
     current_seed = seed_tag
     for step in range(int(additions)):
         if step > 0:
-            raw_tag = f"KR_C{cycle}_{label_name}_RAW{step}"
+            raw_tag = f"{tag_prefix}_C{cycle}_{label_name}_RAW{step}"
             fitted_apply(
                 solver,
                 h_dec_mpo,
@@ -796,7 +890,9 @@ def extend_sector_chain(
                 tolerance,
             )
             current_seed = raw_tag
-        output_prefix = f"KR_C{cycle}_{label_name}_D{len(same_sector_tags)}"
+        output_prefix = (
+            f"{tag_prefix}_C{cycle}_{label_name}_D{len(same_sector_tags)}"
+        )
         orthogonalized = two_pass_orthogonalize(
             solver,
             current_seed,
@@ -854,6 +950,7 @@ def extend_sector_chains_isolated(
                 bond_dim=request["bond_dim"],
                 sweeps=request["sweeps"],
                 tolerance=request["tolerance"],
+                tag_prefix=request.get("tag_prefix", "KR"),
             )
             for request in requests
         ]
@@ -887,6 +984,7 @@ def extend_sector_chains_isolated(
                 "bond_dim": int(request["bond_dim"]),
                 "sweeps": int(request["sweeps"]),
                 "tolerance": float(request["tolerance"]),
+                "tag_prefix": request.get("tag_prefix", "KR"),
                 "threads": threads,
             }
         )
@@ -922,6 +1020,7 @@ def build_coupled_matrices(
     matrix_path,
     progress_path,
     resume=True,
+    reuse_matrix_paths=(),
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Incrementally construct $H_K$ and $S_K$ with exact sector sparsity."""
     matrix_path = Path(matrix_path)
@@ -957,6 +1056,56 @@ def build_coupled_matrices(
                 f"[coupled matrix] reused {extent} x {extent} prefix",
                 flush=True,
             )
+    if np.any(np.isnan(hamiltonian.real)):
+        target_by_tag = {
+            item["tag"]: (index, item)
+            for index, item in enumerate(basis_ids)
+        }
+        for reuse_path in reuse_matrix_paths:
+            reuse_path = Path(reuse_path)
+            if reuse_path == matrix_path or not reuse_path.exists():
+                continue
+            reuse_metadata = load_json(matrix_metadata_path(reuse_path), {})
+            reuse_basis = reuse_metadata.get("basis", [])
+            saved = np.load(reuse_path)
+            reuse_h = np.asarray(saved["hamiltonian"], dtype=np.complex128)
+            reuse_s = np.asarray(saved["overlap"], dtype=np.complex128)
+            source_by_tag = {
+                item["tag"]: (index, item)
+                for index, item in enumerate(reuse_basis)
+            }
+            imported = 0
+            for left_tag, (left, left_item) in target_by_tag.items():
+                source_left = source_by_tag.get(left_tag)
+                if source_left is None or source_left[1] != left_item:
+                    continue
+                for right_tag, (right, right_item) in target_by_tag.items():
+                    source_right = source_by_tag.get(right_tag)
+                    if source_right is None or source_right[1] != right_item:
+                        continue
+                    old_left = source_left[0]
+                    old_right = source_right[0]
+                    if (
+                        not np.isnan(hamiltonian[left, right].real)
+                        or not np.isnan(overlap[left, right].real)
+                        or old_left >= reuse_h.shape[0]
+                        or old_right >= reuse_h.shape[1]
+                        or old_left >= reuse_s.shape[0]
+                        or old_right >= reuse_s.shape[1]
+                        or np.isnan(reuse_h[old_left, old_right].real)
+                        or np.isnan(reuse_s[old_left, old_right].real)
+                    ):
+                        continue
+                    hamiltonian[left, right] = reuse_h[old_left, old_right]
+                    overlap[left, right] = reuse_s[old_left, old_right]
+                    imported += 1
+            if imported:
+                print(
+                    f"[coupled matrix] imported {imported} elements from "
+                    f"{reuse_path}",
+                    flush=True,
+                )
+                break
     contractions = 0
     skipped_h = 0
     skipped_s = 0

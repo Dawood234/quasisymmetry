@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 import time
 from pathlib import Path
@@ -12,6 +14,7 @@ from common import atomic_json, label_text, load_json
 from linear_algebra import (
     canonical_generalized_eigh,
     choose_residual_labels,
+    select_external_projector_branches,
     variational_curve_is_monotone,
 )
 from mps_krylov import (
@@ -27,6 +30,14 @@ from mps_krylov import (
     projector_beam_split,
     validate_fitted_ritz,
 )
+
+
+COUPLED_STATE_VERSION = 2
+COUPLED_BASIS_FILE = "basis_manifest_v2.json"
+COUPLED_CURVE_FILE = "coupled_curve_v2.json"
+COUPLED_MATRIX_FILE = "coupled_matrices_v2.npz"
+COUPLED_MATRIX_PROGRESS_FILE = "matrix_progress_v2.json"
+COUPLED_SUMMARY_FILE = "coupled_summary_v2.json"
 
 
 def add_project_path(project_dir) -> None:
@@ -215,12 +226,15 @@ def external_projector_split(
     sweeps,
     tolerance,
     fit_loss_tolerance,
+    absolute_weight_cutoff,
+    relative_weight_cutoff,
+    fit_loss_multiplier,
     project_dir,
     workers,
     total_threads,
     exclude_anchor=True,
 ) -> dict:
-    """Increase beam width or fitting bond dimension until leakage is captured."""
+    """Capture and filter external residual weight without anchor normalization."""
     maximum_width = 2 ** len(np.atleast_2d(parity_solver))
     width = min(int(initial_width), maximum_width)
     current_bond = int(bond_dim)
@@ -240,17 +254,31 @@ def external_projector_split(
             worker_root=Path(work_dir) / "projector_workers",
             workers=workers,
             total_threads=total_threads,
+            protected_label=anchor_label if exclude_anchor else None,
         )
-        external = list(split["branches"])
-        if exclude_anchor:
-            external = [
-                item
-                for item in external
-                if tuple(item["label"]) != tuple(anchor_label)
-            ]
-        external_weight = sum(float(item["norm2"]) for item in external)
-        source_norm2 = max(float(split["source_norm2"]), 1.0e-30)
-        capture = external_weight / source_norm2
+        selection = select_external_projector_branches(
+            branches=split["branches"],
+            source_norm2=split["source_norm2"],
+            anchor_label=anchor_label,
+            minimum_capture=minimum_capture,
+            compression_loss=split["compression_loss"],
+            absolute_weight_cutoff=absolute_weight_cutoff,
+            relative_weight_cutoff=relative_weight_cutoff,
+            fit_loss_multiplier=fit_loss_multiplier,
+        )
+        attempt_record = {
+            "schema": "quasisymmetry.external_projector_selection",
+            "version": COUPLED_STATE_VERSION,
+            "prefix": attempt_prefix,
+            "beam_width": width,
+            "bond_dim": current_bond,
+            **selection,
+        }
+        atomic_json(
+            Path(work_dir)
+            / f"{attempt_prefix}_external_selection_v2.json",
+            attempt_record,
+        )
         if (
             float(split["compression_loss"]) > float(fit_loss_tolerance)
             and current_bond < int(extra_bond_dim)
@@ -262,23 +290,71 @@ def external_projector_split(
             )
             current_bond = int(extra_bond_dim)
             continue
-        if capture >= float(minimum_capture) or width >= maximum_width:
+        anchor_resolved = (
+            not exclude_anchor or bool(selection["anchor_present"])
+        )
+        if (
+            anchor_resolved
+            and selection["raw_target_met"]
+            and selection["selection_target_met"]
+        ):
+            print(
+                f"[projector] external-only capture "
+                f"{selection['selected_external_capture']:.6%}; "
+                f"selected {len(selection['selected_branches'])}/"
+                f"{len(selection['selected_branches']) + len(selection['rejected_branches'])} "
+                f"external branches; noise floor="
+                f"{selection['noise_floor']:.3e}",
+                flush=True,
+            )
             return {
                 **split,
-                "external_branches": external,
-                "external_weight": external_weight,
-                "external_capture": capture,
+                **selection,
+                "external_branches": selection["selected_branches"],
+                "external_weight": selection["selected_external_weight"],
+                "external_capture": selection["selected_external_capture"],
                 "effective_beam_width": width,
                 "effective_bond_dim": current_bond,
                 "anchor_excluded": bool(exclude_anchor),
+                "selection_record": str(
+                    Path(work_dir)
+                    / f"{attempt_prefix}_external_selection_v2.json"
+                ),
             }
-        new_width = min(maximum_width, width * 2)
-        print(
-            f"[projector] external capture {capture:.6%} below "
-            f"{minimum_capture:.6%}; beam {width} -> {new_width}",
-            flush=True,
+        if width < maximum_width:
+            new_width = min(maximum_width, width * 2)
+            reason = (
+                "anchor branch was not resolved"
+                if not anchor_resolved
+                else (
+                    f"raw external capture "
+                    f"{selection['raw_external_capture']:.6%}, filtered "
+                    f"{selection['selected_external_capture']:.6%}"
+                )
+            )
+            print(
+                f"[projector] {reason}; target={minimum_capture:.6%}; "
+                f"beam {width} -> {new_width}",
+                flush=True,
+            )
+            width = new_width
+            continue
+        if current_bond < int(extra_bond_dim):
+            print(
+                f"[projector] full beam did not meet the reliable external "
+                f"capture target; retrying at M={extra_bond_dim}",
+                flush=True,
+            )
+            current_bond = int(extra_bond_dim)
+            continue
+        raise RuntimeError(
+            "projector branch filtering could not meet the external leakage "
+            f"target {minimum_capture:.6%}; raw="
+            f"{selection['raw_external_capture']:.6%}, filtered="
+            f"{selection['selected_external_capture']:.6%}, "
+            f"noise_floor={selection['noise_floor']:.3e}. "
+            f"See {attempt_record['prefix']}_external_selection_v2.json."
         )
-        width = new_width
 
 
 def basis_depths(basis) -> dict:
@@ -288,6 +364,70 @@ def basis_depths(basis) -> dict:
         label = tuple(item["label"])
         counts[label] = counts.get(label, 0) + 1
     return counts
+
+
+def coupled_state_fingerprint(payload) -> str:
+    """Hash the settings that define one restart-compatible coupled basis."""
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def write_coupled_basis(path, basis, configuration, fingerprint) -> None:
+    """Checkpoint the versioned basis and its scientific selection settings."""
+    atomic_json(
+        path,
+        {
+            "schema": "quasisymmetry.equilibrium_mps_coupled_basis",
+            "version": COUPLED_STATE_VERSION,
+            "configuration": configuration,
+            "configuration_fingerprint": fingerprint,
+            "basis": basis,
+        },
+    )
+
+
+def reusable_legacy_initial_basis(
+    solver,
+    legacy_path,
+    anchor_item,
+    selected_labels,
+    additions,
+) -> list[dict] | None:
+    """Import a complete compatible cycle-zero basis from the legacy run."""
+    legacy = load_json(legacy_path, {}).get("basis", [])
+    if not legacy:
+        return None
+    if (
+        legacy[0].get("tag") != anchor_item["tag"]
+        or tuple(legacy[0].get("label", []))
+        != tuple(anchor_item["label"])
+    ):
+        return None
+
+    reused = [dict(anchor_item)]
+    for label in selected_labels:
+        candidates = sorted(
+            [
+                dict(item)
+                for item in legacy
+                if tuple(item.get("label", [])) == tuple(label)
+                and int(item.get("cycle", -1)) == 0
+                and item.get("kind") in {"residual_seed", "sector_krylov"}
+            ],
+            key=lambda item: int(item.get("depth", 0)),
+        )
+        candidates = candidates[: int(additions)]
+        if len(candidates) != int(additions) or not all(
+            mps_tag_exists(solver.store_dir, item["tag"])
+            for item in candidates
+        ):
+            return None
+        reused.extend(candidates)
+    return reused
 
 
 def add_projected_branches(
@@ -307,6 +447,7 @@ def add_projected_branches(
     project_dir,
     workers,
     total_threads,
+    tag_prefix="KR_V2",
 ) -> list[dict]:
     """Orthogonalize selected projected residual branches and extend Krylov chains."""
     by_label = {
@@ -339,6 +480,7 @@ def add_projected_branches(
                 "bond_dim": bond_dim,
                 "sweeps": sweeps,
                 "tolerance": tolerance,
+                "tag_prefix": tag_prefix,
             }
         )
         reserved += requested
@@ -369,6 +511,7 @@ def add_projected_branches(
                 bond_dim=request["bond_dim"],
                 sweeps=request["sweeps"],
                 tolerance=request["tolerance"],
+                tag_prefix=request["tag_prefix"],
             )
         )
     return created
@@ -413,6 +556,9 @@ def run_residual_adaptive_coupling(
     fit_sweeps,
     fit_tolerance,
     fit_norm_loss_tolerance,
+    projector_absolute_weight_cutoff,
+    projector_relative_weight_cutoff,
+    projector_fit_loss_multiplier,
     fit_energy_tolerance_mha,
     initial_krylov_depth,
     residual_sectors_per_cycle,
@@ -433,6 +579,86 @@ def run_residual_adaptive_coupling(
     output_dir.mkdir(parents=True, exist_ok=True)
     parity_solver = np.atleast_2d(np.asarray(parity_solver, dtype=int))
     anchor_label = tuple(int(bit) for bit in anchor_label)
+    coupled_configuration = {
+        "anchor_tag": str(anchor_tag),
+        "anchor_label": list(anchor_label),
+        "parity_solver": parity_solver.tolist(),
+        "decoupled_energy": float(decoupled_energy),
+        "reference_energy": float(reference_energy),
+        "initial_beam_width": int(initial_beam_width),
+        "minimum_capture": float(minimum_capture),
+        "fit_bond_dim": int(fit_bond_dim),
+        "fit_extra_bond_dim": int(fit_extra_bond_dim),
+        "fit_sweeps": int(fit_sweeps),
+        "fit_tolerance": float(fit_tolerance),
+        "fit_norm_loss_tolerance": float(fit_norm_loss_tolerance),
+        "fit_energy_tolerance_mha": float(fit_energy_tolerance_mha),
+        "projector_absolute_weight_cutoff": float(
+            projector_absolute_weight_cutoff
+        ),
+        "projector_relative_weight_cutoff": float(
+            projector_relative_weight_cutoff
+        ),
+        "projector_fit_loss_multiplier": float(
+            projector_fit_loss_multiplier
+        ),
+        "initial_krylov_depth": int(initial_krylov_depth),
+        "residual_sectors_per_cycle": int(residual_sectors_per_cycle),
+        "max_cycles": int(max_cycles),
+        "standard_k_cap": int(standard_k_cap),
+        "extended_k_cap": int(extended_k_cap),
+        "extended_krylov_depth": int(extended_krylov_depth),
+        "overlap_cutoff": float(overlap_cutoff),
+        "chemical_accuracy_mha": float(chemical_accuracy_mha),
+        "energy_change_tolerance_mha": float(
+            energy_change_tolerance_mha
+        ),
+    }
+    configuration_fingerprint = coupled_state_fingerprint(
+        coupled_configuration
+    )
+    configuration_path = output_dir / "coupled_configuration_v2.json"
+    saved_configuration = (
+        load_json(configuration_path, {}) if resume else {}
+    )
+    if (
+        saved_configuration
+        and saved_configuration.get("configuration_fingerprint")
+        != configuration_fingerprint
+    ):
+        raise ValueError(
+            "the v2 coupled-state settings changed; use a new run directory "
+            "or archive the existing v2 coupled checkpoints"
+        )
+    atomic_json(
+        configuration_path,
+        {
+            "schema": "quasisymmetry.equilibrium_mps_coupled_configuration",
+            "version": COUPLED_STATE_VERSION,
+            "configuration": coupled_configuration,
+            "configuration_fingerprint": configuration_fingerprint,
+        },
+    )
+    completed_summary = (
+        load_json(output_dir / COUPLED_SUMMARY_FILE, {}) if resume else {}
+    )
+    if completed_summary:
+        if (
+            int(completed_summary.get("version", -1))
+            != COUPLED_STATE_VERSION
+            or completed_summary.get("configuration_fingerprint")
+            != configuration_fingerprint
+        ):
+            raise ValueError(
+                "the completed v2 coupled summary is incompatible with the "
+                "current settings"
+            )
+        print(
+            f"[coupled restart v2] reusing completed "
+            f"{output_dir / COUPLED_SUMMARY_FILE}",
+            flush=True,
+        )
+        return completed_summary
     full_mpo = solver.hamiltonian_mpo()
     h_dec_mpo = decoupled_mpo(solver, parity_solver)
     signatures = build_transition_signatures(solver, parity_solver)
@@ -450,11 +676,31 @@ def run_residual_adaptive_coupling(
         "cycle": -1,
         "depth": 0,
     }
-    basis_path = output_dir / "basis_manifest.json"
-    saved_basis = load_json(basis_path, {}).get("basis", []) if resume else []
+    basis_path = output_dir / COUPLED_BASIS_FILE
+    saved_basis_payload = load_json(basis_path, {}) if resume else {}
+    if saved_basis_payload and (
+        int(saved_basis_payload.get("version", -1)) != COUPLED_STATE_VERSION
+        or saved_basis_payload.get("configuration_fingerprint")
+        != configuration_fingerprint
+    ):
+        raise ValueError(
+            "the saved v2 coupled basis is incompatible with the current "
+            "selection settings"
+        )
+    saved_basis = saved_basis_payload.get("basis", [])
     basis = saved_basis if saved_basis else [anchor_item]
     if basis[0]["tag"] != anchor_tag:
         raise ValueError("saved coupled basis does not begin with the current anchor")
+    missing_basis_tags = [
+        item["tag"]
+        for item in basis
+        if not mps_tag_exists(solver.store_dir, item["tag"])
+    ]
+    if missing_basis_tags:
+        raise ValueError(
+            "saved v2 coupled basis references missing MPS tags: "
+            + ", ".join(missing_basis_tags[:5])
+        )
 
     initial_residual = make_residual(
         solver,
@@ -481,10 +727,26 @@ def run_residual_adaptive_coupling(
         sweeps=fit_sweeps,
         tolerance=fit_tolerance,
         fit_loss_tolerance=fit_norm_loss_tolerance,
+        absolute_weight_cutoff=projector_absolute_weight_cutoff,
+        relative_weight_cutoff=projector_relative_weight_cutoff,
+        fit_loss_multiplier=projector_fit_loss_multiplier,
         project_dir=project_dir,
         workers=sector_workers,
         total_threads=total_threads,
     )
+    initial_selection_record = load_json(initial_split["selection_record"], {})
+    initial_selection_record.update(
+        {
+            "directions_per_selected_branch": int(initial_krylov_depth),
+            "proposed_initial_K": min(
+                int(standard_k_cap),
+                1
+                + len(initial_split["external_branches"])
+                * int(initial_krylov_depth),
+            ),
+        }
+    )
+    atomic_json(initial_split["selection_record"], initial_selection_record)
     if len(basis) == 1:
         initial_labels = [
             tuple(item["label"])
@@ -493,29 +755,50 @@ def run_residual_adaptive_coupling(
                 key=lambda item: -float(item["norm2"]),
             )
         ]
-        basis.extend(
-            add_projected_branches(
-                solver=solver,
-                h_dec_mpo=h_dec_mpo,
-                branches=initial_split["external_branches"],
-                selected_labels=initial_labels,
-                basis=basis,
-                additions=initial_krylov_depth,
-                cycle=0,
-                work_dir=output_dir,
-                bond_dim=initial_split["effective_bond_dim"],
-                sweeps=fit_sweeps,
-                tolerance=fit_tolerance,
-                k_cap=standard_k_cap,
-                parity_solver=parity_solver,
-                project_dir=project_dir,
-                workers=sector_workers,
-                total_threads=total_threads,
-            )
+        legacy_basis = reusable_legacy_initial_basis(
+            solver=solver,
+            legacy_path=output_dir / "basis_manifest.json",
+            anchor_item=anchor_item,
+            selected_labels=initial_labels,
+            additions=initial_krylov_depth,
         )
-        atomic_json(basis_path, {"basis": basis})
+        if legacy_basis is not None:
+            basis = legacy_basis
+            print(
+                f"[coupled restart v2] imported K={len(basis)} from the "
+                "compatible subset of the legacy basis",
+                flush=True,
+            )
+        else:
+            basis.extend(
+                add_projected_branches(
+                    solver=solver,
+                    h_dec_mpo=h_dec_mpo,
+                    branches=initial_split["external_branches"],
+                    selected_labels=initial_labels,
+                    basis=basis,
+                    additions=initial_krylov_depth,
+                    cycle=0,
+                    work_dir=output_dir,
+                    bond_dim=initial_split["effective_bond_dim"],
+                    sweeps=fit_sweeps,
+                    tolerance=fit_tolerance,
+                    k_cap=standard_k_cap,
+                    parity_solver=parity_solver,
+                    project_dir=project_dir,
+                    workers=sector_workers,
+                    total_threads=total_threads,
+                    tag_prefix="KR_V2",
+                )
+            )
+        write_coupled_basis(
+            basis_path,
+            basis,
+            coupled_configuration,
+            configuration_fingerprint,
+        )
 
-    curve_path = output_dir / "coupled_curve.json"
+    curve_path = output_dir / COUPLED_CURVE_FILE
     curve = load_json(curve_path, {}).get("cycles", []) if resume else []
     previous_energy = curve[-1]["energy"] if curve else None
     start_cycle = (curve[-1]["cycle"] + 1) if curve else 0
@@ -529,15 +812,16 @@ def run_residual_adaptive_coupling(
             f"sectors={len(basis_depths(basis))}",
             flush=True,
         )
-        matrix_path = output_dir / "coupled_matrices.npz"
+        matrix_path = output_dir / COUPLED_MATRIX_FILE
         hamiltonian, overlap, matrix_diagnostics = build_coupled_matrices(
             solver=solver,
             basis=basis,
             full_hamiltonian_mpo=full_mpo,
             transition_signatures=signatures,
             matrix_path=matrix_path,
-            progress_path=output_dir / "matrix_progress.json",
+            progress_path=output_dir / COUPLED_MATRIX_PROGRESS_FILE,
             resume=resume,
+            reuse_matrix_paths=[output_dir / "coupled_matrices.npz"],
         )
         solution = canonical_generalized_eigh(
             hamiltonian,
@@ -546,7 +830,7 @@ def run_residual_adaptive_coupling(
         )
         energy = float(solution["energies"][0])
         coefficients = np.asarray(solution["coefficients"][:, 0])
-        ritz_tag = f"RITZ_C{cycle}"
+        ritz_tag = f"RITZ_V2_C{cycle}"
         balanced_linear_combination(
             solver,
             [item["tag"] for item in basis],
@@ -572,7 +856,7 @@ def run_residual_adaptive_coupling(
                 f"retrying at M={fit_extra_bond_dim}",
                 flush=True,
             )
-            ritz_tag = f"RITZ_C{cycle}_M{fit_extra_bond_dim}"
+            ritz_tag = f"RITZ_V2_C{cycle}_M{fit_extra_bond_dim}"
             balanced_linear_combination(
                 solver,
                 [item["tag"] for item in basis],
@@ -592,7 +876,7 @@ def run_residual_adaptive_coupling(
             full_mpo,
             ritz_tag,
             fit_validation["energy"],
-            f"CYCLE{cycle}",
+            f"V2_CYCLE{cycle}",
             output_dir,
             effective_fit_bond,
             fit_sweeps,
@@ -628,7 +912,7 @@ def run_residual_adaptive_coupling(
         curve.sort(key=lambda item: int(item["cycle"]))
         atomic_json(curve_path, {"cycles": curve})
         atomic_json(
-            output_dir / f"cycle_{cycle}.json",
+            output_dir / f"cycle_v2_{cycle}.json",
             {
                 **record,
                 "basis": basis,
@@ -674,7 +958,7 @@ def run_residual_adaptive_coupling(
             parity_solver=parity_solver,
             anchor_label=anchor_label,
             work_dir=output_dir,
-            prefix=f"RESIDUAL_C{cycle}",
+            prefix=f"V2_RESIDUAL_C{cycle}",
             initial_width=initial_beam_width,
             minimum_capture=minimum_capture,
             bond_dim=effective_fit_bond,
@@ -682,6 +966,9 @@ def run_residual_adaptive_coupling(
             sweeps=fit_sweeps,
             tolerance=fit_tolerance,
             fit_loss_tolerance=fit_norm_loss_tolerance,
+            absolute_weight_cutoff=projector_absolute_weight_cutoff,
+            relative_weight_cutoff=projector_relative_weight_cutoff,
+            fit_loss_multiplier=projector_fit_loss_multiplier,
             project_dir=project_dir,
             workers=sector_workers,
             total_threads=total_threads,
@@ -700,6 +987,20 @@ def run_residual_adaptive_coupling(
             residual_sectors_per_cycle,
             anchor_label,
         )
+        residual_selection_record = load_json(split["selection_record"], {})
+        residual_selection_record.update(
+            {
+                "selected_labels_for_enrichment": [
+                    list(label) for label in selected_labels
+                ],
+                "directions_per_selected_branch": additions,
+                "proposed_K_after_enrichment": min(
+                    k_cap,
+                    len(basis) + len(selected_labels) * additions,
+                ),
+            }
+        )
+        atomic_json(split["selection_record"], residual_selection_record)
         new_items = add_projected_branches(
             solver=solver,
             h_dec_mpo=h_dec_mpo,
@@ -717,13 +1018,18 @@ def run_residual_adaptive_coupling(
             project_dir=project_dir,
             workers=sector_workers,
             total_threads=total_threads,
-            exclude_anchor=False,
+            tag_prefix="KR_V2",
         )
         if not new_items:
             print("[coupled] residual produced no independent directions", flush=True)
             break
         basis.extend(new_items)
-        atomic_json(basis_path, {"basis": basis})
+        write_coupled_basis(
+            basis_path,
+            basis,
+            coupled_configuration,
+            configuration_fingerprint,
+        )
         previous_energy = energy
 
     if final_solution is None or final_matrix is None or final_overlap is None:
@@ -733,7 +1039,7 @@ def run_residual_adaptive_coupling(
     final_record = curve[-1]
     output = {
         "schema": "quasisymmetry.equilibrium_mps_coupled",
-        "version": 1,
+        "version": COUPLED_STATE_VERSION,
         "method": "coupling_seeded_mps_krylov_with_residual_enrichment",
         "reference_energy": float(reference_energy),
         "decoupled_energy": float(decoupled_energy),
@@ -751,6 +1057,23 @@ def run_residual_adaptive_coupling(
         "initial_leakage": {
             "residual_norm": initial_residual["norm"],
             "external_capture": initial_split["external_capture"],
+            "raw_external_capture": initial_split["raw_external_capture"],
+            "anchor_residual_fraction": initial_split["anchor_fraction"],
+            "external_total_weight": initial_split["external_total_weight"],
+            "external_is_numerical_noise": initial_split[
+                "external_is_numerical_noise"
+            ],
+            "selected_external_weight": initial_split[
+                "selected_external_weight"
+            ],
+            "selected_branch_count": len(
+                initial_split["selected_branches"]
+            ),
+            "rejected_branch_count": len(
+                initial_split["rejected_branches"]
+            ),
+            "noise_floor": initial_split["noise_floor"],
+            "selection_record": initial_split["selection_record"],
             "effective_beam_width": initial_split["effective_beam_width"],
             "effective_bond_dim": initial_split["effective_bond_dim"],
             "compression_loss": initial_split["compression_loss"],
@@ -772,6 +1095,9 @@ def run_residual_adaptive_coupling(
             "removed_overlap_directions"
         ],
         "sector_cleanliness": cleanliness,
+        "configuration_fingerprint": configuration_fingerprint,
+        "basis_manifest": str(basis_path),
+        "coupled_matrix": str(output_dir / COUPLED_MATRIX_FILE),
     }
-    atomic_json(output_dir / "coupled_summary.json", output)
+    atomic_json(output_dir / COUPLED_SUMMARY_FILE, output)
     return output

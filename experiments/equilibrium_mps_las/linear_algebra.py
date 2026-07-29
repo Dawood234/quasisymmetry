@@ -162,3 +162,172 @@ def choose_residual_labels(
             continue
         ordered.append(label)
     return ordered[: int(maximum)]
+
+
+def retain_projector_candidates(
+    candidates,
+    beam_width,
+    protected_prefix=None,
+) -> tuple[list[dict], list[dict]]:
+    """Keep the strongest branches while preserving one required label prefix."""
+    ordered = sorted(candidates, key=lambda item: -float(item["norm2"]))
+    width = max(1, int(beam_width))
+    if protected_prefix is None:
+        return ordered[:width], ordered[width:]
+
+    protected_prefix = tuple(int(bit) for bit in protected_prefix)
+    protected = next(
+        (
+            item
+            for item in ordered
+            if tuple(int(bit) for bit in item["label"]) == protected_prefix
+        ),
+        None,
+    )
+    if protected is None or protected in ordered[:width]:
+        return ordered[:width], ordered[width:]
+
+    kept = [protected]
+    kept.extend(item for item in ordered if item is not protected)
+    kept = sorted(kept[:width], key=lambda item: -float(item["norm2"]))
+    kept_ids = {id(item) for item in kept}
+    pruned = [item for item in ordered if id(item) not in kept_ids]
+    return kept, pruned
+
+
+def select_external_projector_branches(
+    branches,
+    source_norm2,
+    anchor_label,
+    minimum_capture,
+    compression_loss=0.0,
+    absolute_weight_cutoff=1.0e-10,
+    relative_weight_cutoff=1.0e-10,
+    fit_loss_multiplier=1.0,
+) -> dict:
+    """Select reliable external branches using external-only normalization."""
+    source_norm2 = max(0.0, float(source_norm2))
+    minimum_capture = float(minimum_capture)
+    if not 0.0 < minimum_capture <= 1.0:
+        raise ValueError("minimum_capture must lie in (0, 1]")
+    if min(
+        absolute_weight_cutoff,
+        relative_weight_cutoff,
+        fit_loss_multiplier,
+    ) < 0.0:
+        raise ValueError("projector branch thresholds must be nonnegative")
+
+    anchor_label = tuple(int(bit) for bit in anchor_label)
+    normalized = []
+    for item in branches:
+        copied = dict(item)
+        copied["label"] = [int(bit) for bit in item["label"]]
+        copied["norm2"] = max(0.0, float(item["norm2"]))
+        normalized.append(copied)
+
+    anchor_branches = [
+        item for item in normalized if tuple(item["label"]) == anchor_label
+    ]
+    anchor_weight = sum(float(item["norm2"]) for item in anchor_branches)
+    external = sorted(
+        [
+            item
+            for item in normalized
+            if tuple(item["label"]) != anchor_label
+        ],
+        key=lambda item: -float(item["norm2"]),
+    )
+    external_total = max(0.0, source_norm2 - anchor_weight)
+    raw_external_weight = sum(float(item["norm2"]) for item in external)
+    compression_loss = max(0.0, float(compression_loss))
+    noise_floor = max(
+        float(absolute_weight_cutoff),
+        float(relative_weight_cutoff) * external_total,
+        float(fit_loss_multiplier) * compression_loss,
+    )
+    external_is_numerical_noise = external_total <= noise_floor
+    raw_capture = (
+        1.0
+        if external_is_numerical_noise
+        else min(1.0, raw_external_weight / external_total)
+    )
+
+    selected = []
+    rejected = []
+    selected_weight = 0.0
+    for item in external:
+        weight = float(item["norm2"])
+        if weight <= noise_floor:
+            rejected.append(
+                {
+                    **item,
+                    "rejection_reason": "below_noise_floor",
+                    "cumulative_external_capture": (
+                        1.0
+                        if external_is_numerical_noise
+                        else min(1.0, selected_weight / external_total)
+                    ),
+                }
+            )
+            continue
+        capture = (
+            1.0
+            if external_is_numerical_noise
+            else selected_weight / external_total
+        )
+        if capture >= minimum_capture:
+            rejected.append(
+                {
+                    **item,
+                    "rejection_reason": "beyond_capture_target",
+                    "cumulative_external_capture": min(1.0, capture),
+                }
+            )
+            continue
+        selected_weight += weight
+        selected.append(
+            {
+                **item,
+                "cumulative_external_capture": (
+                    1.0
+                    if external_is_numerical_noise
+                    else min(1.0, selected_weight / external_total)
+                ),
+            }
+        )
+
+    selected_capture = (
+        1.0
+        if external_is_numerical_noise
+        else min(1.0, selected_weight / external_total)
+    )
+    return {
+        "anchor_label": list(anchor_label),
+        "anchor_present": bool(anchor_branches),
+        "anchor_weight": anchor_weight,
+        "anchor_fraction": (
+            0.0 if source_norm2 <= 1.0e-30 else anchor_weight / source_norm2
+        ),
+        "source_norm2": source_norm2,
+        "external_total_weight": external_total,
+        "external_is_numerical_noise": external_is_numerical_noise,
+        "raw_external_weight": raw_external_weight,
+        "raw_external_capture": raw_capture,
+        "raw_target_met": raw_capture >= minimum_capture,
+        "selected_external_weight": selected_weight,
+        "selected_external_capture": selected_capture,
+        "selection_target_met": selected_capture >= minimum_capture,
+        "unresolved_external_weight": max(
+            0.0, external_total - raw_external_weight
+        ),
+        "noise_floor": noise_floor,
+        "absolute_weight_cutoff": float(absolute_weight_cutoff),
+        "relative_weight_cutoff": float(relative_weight_cutoff),
+        "fit_loss_multiplier": float(fit_loss_multiplier),
+        "compression_loss": compression_loss,
+        "minimum_capture": minimum_capture,
+        "selected_branches": selected,
+        "rejected_branches": rejected,
+        "selected_branch_count": len(selected),
+        "rejected_branch_count": len(rejected),
+    }

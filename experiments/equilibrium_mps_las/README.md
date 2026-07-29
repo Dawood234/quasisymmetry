@@ -185,6 +185,52 @@ Repeat the same command with `--resume`. Artifact hashes must match the first
 launch. Completed macrocycles, DMRG stages, fitted MPS operations, coupled
 matrix rows, and enrichment cycles are reused.
 
+NC selection is also restartable inside an unfinished selection pass. Every
+candidate score is written atomically below
+`macrocycle_<n>/selection_<before|after>/candidate_scores/` immediately after
+that candidate finishes. The seven selected-generator expectations are saved
+individually below `generator_signs/`. Each record contains an input
+fingerprint covering the proxy MPS, candidate rows, orbital rotation, and
+multiply settings; incompatible records are ignored rather than silently
+reused. This matters especially for N2, whose seniority-plus-quartet pool has
+171 candidates.
+
+Both Slurm launchers trap the configured five-minute `USR1` walltime warning.
+The active Python step continues until Slurm enforces the actual time limit,
+while newly completed candidate checkpoints remain reusable. Resubmitting the
+same command with `--resume` computes only the missing candidates and signs.
+
+The coupled evaluator uses corrected `v2` restart files. External leakage
+capture is normalized by
+
+```text
+retained external residual weight
+---------------------------------
+total residual weight - anchor residual weight
+```
+
+rather than by the total residual norm. This prevents an anchor-sector residual
+component from making the requested 99.9% external capture mathematically
+impossible. The code then keeps the smallest reliable external-branch set that
+meets the capture target and rejects branches below the maximum of the absolute,
+relative, and MPS-fit-loss noise floors before normalization.
+
+The corrected files are `basis_manifest_v2.json`, `coupled_curve_v2.json`,
+`coupled_matrices_v2.npz`, and `coupled_summary_v2.json`. Legacy files remain
+untouched. On the first corrected `--resume`, compatible legacy cycle-zero MPS
+directions and arbitrary matching matrix elements are imported into the `v2`
+state. Parent validation, NC scoring, macrocycles, the anchor schedule, the
+anchor residual, and compatible projector results are reused normally. Do not
+run the legacy and corrected jobs concurrently against the same `--run_dir`,
+because both access the same Block2 MPS store.
+
+The branch filters can be changed with
+`--projector_absolute_weight_cutoff`,
+`--projector_relative_weight_cutoff`, and
+`--projector_fit_loss_multiplier`. Their defaults are `1e-10`, `1e-10`, and
+`1.0`, respectively. A `v2` resume fingerprints these scientific settings and
+stops rather than silently loading an incompatible basis.
+
 ## Validation
 
 Run pure local tests without Block2:
