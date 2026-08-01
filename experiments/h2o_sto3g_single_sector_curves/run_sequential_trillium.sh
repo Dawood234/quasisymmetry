@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 #SBATCH --account=rrg-izmaylov
-#SBATCH --job-name=h2o_sto3g_curve
+#SBATCH --job-name=h2o_sto3g_cont
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 # Trillium assigns the complete node memory automatically.
 #SBATCH --time=23:00:00
-#SBATCH --array=0-12%13
-#SBATCH --output=h2o_sto3g_curve_%A_%a.out
-#SBATCH --mail-type=FAIL
+#SBATCH --output=h2o_sto3g_continuation_%j.out
+#SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=davood.dar@utoronto.ca
 
 set -euo pipefail
@@ -22,13 +21,8 @@ venv_dir="${LAS_VENV:-$HOME/las-env-trillium}"
 single_sector_dir="${SINGLE_SECTOR_OO_DIR:-$HOME/links/projects/$slurm_account/$USER/single_sector_oo}"
 run_dir="${H2O_CURVE_RUN_DIR:-$SCRATCH/alris/quasisymmetry/h2o/sto-3g/single_sector_continuation_curves_20260801}"
 threads="${SLURM_CPUS_PER_TASK:-8}"
-
-distances=(
-    0.70 0.80 0.90 0.958 1.10 1.25 1.50 1.75 2.00 2.25
-    2.50 2.75 3.00
-)
-task_index="${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID is required}"
-distance="${distances[$task_index]}"
+maxiter="${H2O_MAXITER:-60}"
+neighbor_passes="${H2O_NEIGHBOR_REFIT_PASSES:-1}"
 
 if [[ ! -x "$venv_dir/bin/python" ]]; then
     echo "Python environment not found: $venv_dir" >&2
@@ -52,25 +46,42 @@ export OMP_NUM_THREADS="$threads"
 export MKL_NUM_THREADS="$threads"
 export OPENBLAS_NUM_THREADS="$threads"
 export NUMEXPR_NUM_THREADS="$threads"
-export MPLCONFIGDIR="$run_dir/.matplotlib/task_$task_index"
-export XDG_CACHE_HOME="$run_dir/.cache/task_$task_index"
+export MPLCONFIGDIR="$run_dir/.matplotlib/sequential"
+export XDG_CACHE_HOME="$run_dir/.cache/sequential"
+
+grid_args=()
+if [[ -n "${H2O_CURVE_GRID:-}" ]]; then
+    grid_args=(--grid "$H2O_CURVE_GRID")
+fi
+refine_args=()
+if [[ -n "${H2O_REFINE_STEP:-}" ]]; then
+    refine_args=(--refine-step "$H2O_REFINE_STEP")
+fi
 
 echo "Host: $(hostname)"
 echo "Started: $(date --iso-8601=seconds)"
-echo "Array task: $task_index / 12"
-echo "O-H distance: $distance Angstrom"
-echo "Threads: $threads"
 echo "Project: $project_dir"
-echo "single_sector_oo: $single_sector_dir"
+echo "Experiment: $experiment_dir"
 echo "Run directory: $run_dir"
+echo "Threads: $threads"
+echo "Mode: sequential continuation plus neighbor envelope"
+echo "Neighbor-refit passes: $neighbor_passes"
+if [[ -n "${H2O_CURVE_GRID:-}" ]]; then
+    echo "Grid override: $H2O_CURVE_GRID"
+fi
+if [[ -n "${H2O_REFINE_STEP:-}" ]]; then
+    echo "Grid refinement step: $H2O_REFINE_STEP Angstrom"
+fi
 
 srun --ntasks=1 --cpus-per-task="$threads" \
     "$venv_dir/bin/python" -u \
     "$experiment_dir/run_h2o_sto3g_single_sector_family_curves.py" \
-    --grid "$distance" \
+    "${grid_args[@]}" \
+    "${refine_args[@]}" \
     --output-dir "$run_dir" \
-    --maxiter 60 \
-    --resume \
-    --no-aggregate
+    --maxiter "$maxiter" \
+    --neighbor-refit \
+    --neighbor-refit-passes "$neighbor_passes" \
+    --resume
 
 echo "Finished: $(date --iso-8601=seconds)"

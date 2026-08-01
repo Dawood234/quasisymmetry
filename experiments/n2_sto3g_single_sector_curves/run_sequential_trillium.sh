@@ -4,8 +4,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=64G
-#SBATCH --time=3-00:00:00
+# Trillium assigns the complete node memory automatically.
+#SBATCH --time=23:00:00
 #SBATCH --output=n2_sto3g_continuation_%j.out
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=davood.dar@utoronto.ca
