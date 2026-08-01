@@ -4,7 +4,9 @@
 For each geometry and family, this driver enumerates the small fixed-spin
 STO-3G space only at the canonical RHF orbitals, selects the unique lowest
 sector, freezes that determinant support, and minimizes its ground-state
-energy under orbital rotations.  It intentionally does not import the
+energy under orbital rotations.  The ordered curve evaluates both an identity
+start and, after the first point, a continuation start from the previous
+geometry, retaining the lower result.  It intentionally does not import the
 separate ``single_sector_oo`` project.
 
 The four compared families are all-even seniority, unrestricted seniority,
@@ -38,7 +40,7 @@ DEFAULT_OUTPUT = (
     / "quasisymmetry"
     / "n2"
     / "sto-3g"
-    / "single_sector_initial_lowest_curves_20260801"
+    / "single_sector_continuation_curves_20260801"
 )
 
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -246,52 +248,112 @@ def load_candidate(path: Path) -> tuple[dict, np.ndarray]:
     return payload, np.load(rotation_path)
 
 
+def load_or_scan_initial_sector(
+    *,
+    family: str,
+    family_dir: Path,
+    moldata: ffsim.MolecularData,
+    args,
+) -> tuple[dict, dict]:
+    """Cache the canonical lowest sector and reconstruct its determinant support."""
+    scan_path = family_dir / "initial_sector.json"
+    settings = {
+        "backend": "quasisymmetry_ffsim",
+        "family": family,
+        "basis": args.basis,
+        "scan_rotation": "identity",
+    }
+    scan = None
+    if args.resume and scan_path.is_file():
+        candidate = load_json(scan_path)
+        if candidate.get("settings") == settings:
+            scan = candidate
+            print(
+                f"  [{family}] canonical sector scan complete; reusing "
+                f"{candidate['sector_count']} sectors",
+                flush=True,
+            )
+
+    sectors = family_sectors(family, moldata.norb, moldata.nelec)
+    if scan is None:
+        zero_params = np.zeros(moldata.norb * (moldata.norb - 1) // 2)
+        started = time.perf_counter()
+        initial_energy, initial_label, support_dim = scan_initial_sector_energies(
+            moldata, sectors, zero_params, family=family
+        )[0]
+        scan = {
+            "settings": settings,
+            "family": family,
+            "sector": label_text(initial_label),
+            "sector_bits": list(initial_label),
+            "support_dim": int(support_dim),
+            "initial_energy_ha": float(initial_energy),
+            "sector_count": int(len(sectors)),
+            "seconds": float(time.perf_counter() - started),
+            "completed_at": timestamp(),
+        }
+        atomic_json_dump(scan_path, scan)
+
+    initial_label = tuple(int(bit) for bit in scan["sector_bits"])
+    try:
+        support = sectors[initial_label]
+    except KeyError as error:
+        raise RuntimeError(
+            f"Cached sector label {scan['sector']} is not present in the "
+            f"current {family} sector partition."
+        ) from error
+    return scan, support
+
+
 def selected_family_result(
     *,
     family: str,
     point_dir: Path,
     moldata: ffsim.MolecularData,
     reference_energy: float,
+    previous_parameters: np.ndarray | None,
     args,
 ) -> tuple[dict, np.ndarray]:
-    """Optimize exactly one support: the canonical-frame lowest sector."""
+    """Optimize the canonical lowest support from identity and continuation starts."""
     family_dir = point_dir / family
     family_dir.mkdir(parents=True, exist_ok=True)
-    selected_path = family_dir / "selected.json"
     selected_rotation_path = family_dir / "selected_rotation.npy"
     settings = {
         "backend": "quasisymmetry_ffsim",
         "optimization_mode": "fixed-initial-lowest-sector",
+        "continuation": True,
+        "basis": args.basis,
         "maxiter": None if args.no_maxiter else int(args.maxiter),
         "maxfev": args.maxfev,
     }
 
-    raw_path = family_dir / "raw_result.json"
-    if args.resume and raw_path.is_file():
-        payload, rotation = load_candidate(raw_path)
-        if payload.get("optimization_settings") != settings:
-            print(f"  [{family}] settings changed; recomputing raw result", flush=True)
-            payload = None
-        elif bool(payload.get("success")):
-            print(f"  [{family}] complete; reusing raw result", flush=True)
-        else:
-            print(f"  [{family}] raw optimization was unconverged; retrying", flush=True)
-            payload = None
-    else:
-        payload = None
+    scan, support = load_or_scan_initial_sector(
+        family=family,
+        family_dir=family_dir,
+        moldata=moldata,
+        args=args,
+    )
+    print(
+        f"  [{family}] initial lowest sector={scan['sector']} "
+        f"dim={scan['support_dim']} E={scan['initial_energy_ha']:.12f} Ha",
+        flush=True,
+    )
 
-    if payload is None:
-        sectors = family_sectors(family, moldata.norb, moldata.nelec)
-        zero_params = np.zeros(moldata.norb * (moldata.norb - 1) // 2)
-        initial_energy, initial_label, support_dim = scan_initial_sector_energies(
-            moldata, sectors, zero_params, family=family
-        )[0]
-        support = sectors[initial_label]
-        print(
-            f"  [{family}] initial lowest sector={label_text(initial_label)} "
-            f"dim={support_dim} E={initial_energy:.12f} Ha; optimizing fixed support",
-            flush=True,
-        )
+    starts = [("identity", None)]
+    if previous_parameters is not None:
+        starts.append(("continuation", previous_parameters))
+
+    candidates: list[tuple[dict, np.ndarray]] = []
+    for start_label, initial_parameters in starts:
+        candidate_path = family_dir / f"start_{start_label}.json"
+        if args.resume and candidate_path.is_file():
+            candidate, rotation = load_candidate(candidate_path)
+            if candidate.get("optimization_settings") == settings and candidate.get("success"):
+                print(f"  [{family}] {start_label} complete; reusing", flush=True)
+                candidates.append((candidate, rotation))
+                continue
+
+        print(f"  [{family}] optimizing fixed support from {start_label}", flush=True)
         evaluations = 0
 
         def objective(params: np.ndarray) -> float:
@@ -299,13 +361,25 @@ def selected_family_result(
             evaluations += 1
             return float(fixed_sector_energy(moldata, support, params))
 
-        options = {"maxiter": None if args.no_maxiter else args.maxiter, "xtol": 1.0e-4, "ftol": 1.0e-8}
+        options = {
+            "maxiter": None if args.no_maxiter else args.maxiter,
+            "xtol": 1.0e-4,
+            "ftol": 1.0e-8,
+        }
         if options["maxiter"] is None:
             options.pop("maxiter")
         if args.maxfev is not None:
             options["maxfev"] = args.maxfev
+        zero_params = np.zeros(moldata.norb * (moldata.norb - 1) // 2)
+        if initial_parameters is not None:
+            # Reuse the optimizer coordinates directly. This avoids taking a
+            # matrix logarithm of a finite rotation and preserves the exact
+            # parameter convention used by params_to_U.
+            initial_params = np.asarray(initial_parameters, dtype=float).copy()
+        else:
+            initial_params = zero_params
         started = time.perf_counter()
-        result = minimize(objective, zero_params, method="Powell", options=options)
+        result = minimize(objective, initial_params, method="Powell", options=options)
         elapsed = time.perf_counter() - started
         final_energy = float(fixed_sector_energy(moldata, support, result.x))
         rotation = params_to_U(result.x, moldata.norb)
@@ -317,37 +391,44 @@ def selected_family_result(
             "message": str(result.message),
             "energy_ha": final_energy,
             "error_mha_vs_rotated_fci": 1000.0 * (final_energy - reference_energy),
-            "sector": label_text(initial_label),
-            "sector_bits": list(initial_label),
-            "support_dim": int(support_dim),
-            "initial_energy_ha": float(initial_energy),
+            "sector": scan["sector"],
+            "sector_bits": scan["sector_bits"],
+            "support_dim": int(scan["support_dim"]),
+            "initial_energy_ha": float(scan["initial_energy_ha"]),
             "function_evaluations": int(evaluations),
             "iterations": int(result.nit),
             "seconds": float(elapsed),
             "parameters": np.asarray(result.x).tolist(),
-            "start_label": "exact_initial_lowest_sector",
+            "initial_guess": start_label,
             "optimization_settings": settings,
             "rotation": rotation,
         }
-        payload = save_candidate(raw_path, item, rotation)
+        candidate = save_candidate(candidate_path, item, rotation)
+        candidates.append((candidate, rotation))
 
+    if not candidates:
+        raise RuntimeError(f"No completed optimization candidate for {family}.")
+
+    payload, rotation = min(candidates, key=lambda pair: float(pair[0]["energy_ha"]))
     result = dict(payload)
     result["family"] = family
     result["method"] = FAMILY_LABELS[family]
+    result["start_label"] = result["initial_guess"]
     result["candidate_results"] = [
         {
-            "source": result["start_label"],
-            "energy_ha": result["energy_ha"],
-            "error_mha": result["error_mha_vs_rotated_fci"],
-            "sector": result["sector"],
-            "success": result["success"],
-            "function_evaluations": result["function_evaluations"],
+            "source": candidate["initial_guess"],
+            "energy_ha": candidate["energy_ha"],
+            "error_mha": candidate["error_mha_vs_rotated_fci"],
+            "sector": candidate["sector"],
+            "success": candidate["success"],
+            "function_evaluations": candidate["function_evaluations"],
         }
+        for candidate, _candidate_rotation in candidates
     ]
     np.save(selected_rotation_path, rotation)
     result["selected_rotation_path"] = str(selected_rotation_path)
     result["selected_at"] = timestamp()
-    atomic_json_dump(selected_path, result)
+    atomic_json_dump(family_dir / "selected.json", result)
     return result, rotation
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -640,6 +721,7 @@ def main() -> None:
         "maxfev": args.maxfev,
         "backend": "quasisymmetry_ffsim",
         "optimization_mode": "fixed-initial-lowest-sector",
+        "continuation": True,
         "reference": "Full fixed-spin FCI recomputed at every geometry",
         "output_dir": str(args.output_dir),
     }
@@ -682,6 +764,7 @@ def main() -> None:
         print(f"Error plot: {args.output_dir / 'error_curves.png'}", flush=True)
         return
 
+    previous_parameters: dict[str, np.ndarray] = {}
     total_start = time.perf_counter()
     for point_number, distance in enumerate(grid, start=1):
         print("\n" + "=" * 78, flush=True)
@@ -724,8 +807,10 @@ def main() -> None:
                 point_dir=point_dir,
                 moldata=moldata,
                 reference_energy=float(reference["fci_energy_ha"]),
+                previous_parameters=previous_parameters.get(family),
                 args=args,
             )
+            previous_parameters[family] = np.asarray(result["parameters"], dtype=float)
             print(
                 f"  [{family}] sector={result['sector']} dim={result['support_dim']} "
                 f"E={result['energy_ha']:.12f} Ha "
