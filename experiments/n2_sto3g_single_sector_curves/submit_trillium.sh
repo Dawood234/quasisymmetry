@@ -5,18 +5,11 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 slurm_account="${SLURM_ACCOUNT:-rrg-izmaylov}"
 project_dir="${LAS_PROJECT_DIR:-$(cd "$script_dir/../.." && pwd)}"
 venv_dir="${LAS_VENV:-$HOME/las-env-trillium}"
-single_sector_dir="${SINGLE_SECTOR_OO_DIR:-$HOME/links/projects/$slurm_account/$USER/single_sector_oo}"
 run_dir="${N2_CURVE_RUN_DIR:-$SCRATCH/alris/quasisymmetry/n2/sto-3g/single_sector_initial_lowest_curves_20260801}"
 array_spec="${N2_ARRAY_SPEC:-0-20%21}"
 
-if [[ ! -f "$single_sector_dir/single_sector_oo/__init__.py" ]]; then
-    echo "single_sector_oo project not found: $single_sector_dir" >&2
-    echo "Transfer it first or set SINGLE_SECTOR_OO_DIR." >&2
-    exit 2
-fi
-
 mkdir -p "$run_dir/logs"
-export_values="ALL,LAS_PROJECT_DIR=$project_dir,LAS_VENV=$venv_dir,SINGLE_SECTOR_OO_DIR=$single_sector_dir,N2_CURVE_RUN_DIR=$run_dir"
+export_values="ALL,LAS_PROJECT_DIR=$project_dir,LAS_VENV=$venv_dir,N2_CURVE_RUN_DIR=$run_dir"
 
 array_job="$(sbatch --parsable \
     --account="$slurm_account" \

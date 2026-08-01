@@ -19,7 +19,6 @@ slurm_account="${SLURM_JOB_ACCOUNT:-rrg-izmaylov}"
 project_dir="${LAS_PROJECT_DIR:-$HOME/links/projects/$slurm_account/$USER/quasisymmetry}"
 experiment_dir="$project_dir/experiments/n2_sto3g_single_sector_curves"
 venv_dir="${LAS_VENV:-$HOME/las-env-trillium}"
-single_sector_dir="${SINGLE_SECTOR_OO_DIR:-$HOME/links/projects/$slurm_account/$USER/single_sector_oo}"
 run_dir="${N2_CURVE_RUN_DIR:-$SCRATCH/alris/quasisymmetry/n2/sto-3g/single_sector_initial_lowest_curves_20260801}"
 threads="${SLURM_CPUS_PER_TASK:-8}"
 
@@ -38,14 +37,7 @@ if [[ ! -f "$experiment_dir/run_n2_sto3g_single_sector_family_curves.py" ]]; the
     echo "Experiment driver not found: $experiment_dir" >&2
     exit 2
 fi
-if [[ ! -f "$single_sector_dir/single_sector_oo/__init__.py" ]]; then
-    echo "single_sector_oo project not found: $single_sector_dir" >&2
-    echo "Set SINGLE_SECTOR_OO_DIR to the transferred project root." >&2
-    exit 2
-fi
-
 mkdir -p "$run_dir"
-export SINGLE_SECTOR_OO_DIR="$single_sector_dir"
 export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
 export OMP_NUM_THREADS="$threads"
@@ -61,7 +53,7 @@ echo "Array task: $task_index / 20"
 echo "N-N distance: $distance Angstrom"
 echo "Threads: $threads"
 echo "Project: $project_dir"
-echo "single_sector_oo: $single_sector_dir"
+echo "Backend: quasisymmetry sector utilities + ffsim"
 echo "Run directory: $run_dir"
 
 srun --ntasks=1 --cpus-per-task="$threads" \

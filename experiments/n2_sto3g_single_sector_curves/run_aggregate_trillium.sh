@@ -18,10 +18,8 @@ slurm_account="${SLURM_JOB_ACCOUNT:-rrg-izmaylov}"
 project_dir="${LAS_PROJECT_DIR:-$HOME/links/projects/$slurm_account/$USER/quasisymmetry}"
 experiment_dir="$project_dir/experiments/n2_sto3g_single_sector_curves"
 venv_dir="${LAS_VENV:-$HOME/las-env-trillium}"
-single_sector_dir="${SINGLE_SECTOR_OO_DIR:-$HOME/links/projects/$slurm_account/$USER/single_sector_oo}"
 run_dir="${N2_CURVE_RUN_DIR:-$SCRATCH/alris/quasisymmetry/n2/sto-3g/single_sector_initial_lowest_curves_20260801}"
 
-export SINGLE_SECTOR_OO_DIR="$single_sector_dir"
 export PYTHONUNBUFFERED=1
 export PYTHONDONTWRITEBYTECODE=1
 export OMP_NUM_THREADS=1

@@ -1,35 +1,33 @@
 #!/usr/bin/env python3
-"""Recompute N2/STO-3G optimized single-sector comparison curves.
+"""Compute N2/STO-3G one-sector curves using quasisymmetry and ffsim only.
 
-This is a quasisymmetry experiment built on the canonical
-``single_sector_oo`` implementation.  It compares four independently
-orbital-optimized one-sector models against full STO-3G FCI:
+For each geometry and family, this driver enumerates the small fixed-spin
+STO-3G space only at the canonical RHF orbitals, selects the unique lowest
+sector, freezes that determinant support, and minimizes its ground-state
+energy under orbital rotations.  It intentionally does not import the
+separate ``single_sector_oo`` project.
 
-* CASSCF-like CAS(6e,6o) number sector;
-* all-even seniority-zero/DOCI sector;
-* lowest-energy full seniority sector;
-* quartet-plus-spectator-seniority sector.
-
-Every geometry and family is checkpointed independently. The seniority and
-quartet families are scanned exactly in the canonical frame, and only their
-single lowest sector is orbital optimized. No coupled-sector calculation or
-previously saved LAS energy is used.
+The four compared families are all-even seniority, unrestricted seniority,
+CAS(6e,6o), and seniority plus three quartet products.  No coupled LAS energy
+is used in these curves.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import asdict
 from datetime import datetime
-import importlib.util
 import json
+from math import comb
 import os
 from pathlib import Path
 import sys
 import time
 
+import ffsim
 import numpy as np
+from scipy.optimize import minimize
+from scipy.sparse.linalg import eigsh
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -43,43 +41,23 @@ DEFAULT_OUTPUT = (
     / "single_sector_initial_lowest_curves_20260801"
 )
 
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
-def configure_single_sector_package() -> Path:
-    """Resolve the separately maintained one-sector package."""
-    requested = os.environ.get("SINGLE_SECTOR_OO_DIR")
-    candidates = []
-    if requested:
-        candidates.append(Path(requested).expanduser())
-    candidates.append(REPOSITORY_ROOT.parent / "single_sector_oo")
-
-    if importlib.util.find_spec("single_sector_oo") is None:
-        for candidate in candidates:
-            if (candidate / "single_sector_oo" / "__init__.py").is_file():
-                sys.path.insert(0, str(candidate.resolve()))
-                break
-
-    spec = importlib.util.find_spec("single_sector_oo")
-    if spec is None or spec.origin is None:
-        searched = ", ".join(str(path) for path in candidates)
-        raise ModuleNotFoundError(
-            "single_sector_oo is required for this experiment. Install it in the "
-            "active environment or set SINGLE_SECTOR_OO_DIR to its project root. "
-            f"Searched: {searched}"
-        )
-    return Path(spec.origin).resolve().parent.parent
-
-
-SINGLE_SECTOR_PROJECT = configure_single_sector_package()
-
-from single_sector_oo.backends.determinants import build_spin_string_basis
-from single_sector_oo.backends.integrals import RHFData, build_integrals, transform_integrals
-from single_sector_oo.backends.systems import build_n2_geometry
-from single_sector_oo.workflows.n2.run_n2_sto3g_parity_casscf_generalization import (
-    SectorScreeningConfig,
-    optimize_family,
-    reference_only_results,
+from chemistry import build_n2_geometry
+from src.decoupled_energy import (
+    fixed_sector_energy,
+    rotated_hamiltonian_linop,
+    sector_ground_energy,
 )
+from src.orbital_rotation import params_to_U
+from src.sector_utils import symmetry_sectors
 
+
+# N2/STO-3G canonical-orbital partition used in the prior comparison.
+INACTIVE_1B = (1, 2, 3, 4)
+SPECTATOR_1B = INACTIVE_1B
+QUARTETS_1B = ((7, 10), (5, 8), (6, 9))
 
 FAMILY_ORDER = ("all-even", "seniority", "cas", "quartet")
 FAMILY_LABELS = {
@@ -130,65 +108,112 @@ def geometry_key(distance: float) -> str:
     return f"r_{distance:.4f}".replace(".", "p")
 
 
-def build_integrals_with_rhf_fallback(
-    geometry,
-    basis: str,
-    *,
-    charge: int,
-    multiplicity: int,
-):
-    """Retry stretched-bond RHF with a larger cycle budget.
-
-    PySCF's default 50-cycle RHF solve can stop before convergence for stretched
-    molecules. The fallback changes only the cycle budget and convergence tolerance,
-    preserving the same RHF problem and canonical orbital definition.
-    """
-    try:
-        return build_integrals(
-            geometry,
-            basis,
-            charge=charge,
-            multiplicity=multiplicity,
-        )
-    except RuntimeError as error:
-        if str(error) != "RHF did not converge.":
-            raise
-
+def build_molecular_data(geometry, basis: str) -> tuple[object, ffsim.MolecularData]:
+    """Run canonical RHF and convert it to ffsim molecular data."""
     from pyscf import gto, scf
 
-    print("  [RHF fallback] retrying with max_cycle=300", flush=True)
-    mol = gto.Mole()
-    mol.atom = geometry
-    mol.basis = basis
-    mol.charge = charge
-    mol.spin = multiplicity - 1
-    mol.unit = "Angstrom"
-    mol.symmetry = False
-    mol.build()
-
+    mol = gto.M(
+        atom=geometry,
+        basis=basis,
+        charge=0,
+        spin=0,
+        unit="Angstrom",
+        symmetry=False,
+    )
     mf = scf.RHF(mol)
     mf.max_cycle = 300
     mf.conv_tol = 1.0e-11
-    hf_energy = mf.kernel()
+    energy = mf.kernel()
     if not mf.converged:
-        raise RuntimeError("RHF did not converge after the 300-cycle fallback.")
+        raise RuntimeError("RHF did not converge after 300 cycles.")
+    print(f"  [RHF] E={energy:.12f} Ha", flush=True)
+    return mf, ffsim.MolecularData.from_scf(mf)
 
-    print(
-        f"  [RHF fallback] converged E={hf_energy:.12f} Ha "
-        f"after {getattr(mf, 'cycles', 'unknown')} cycles",
-        flush=True,
+
+def seniority_matrix(norb: int) -> np.ndarray:
+    return np.eye(norb, dtype=np.uint8)
+
+
+def quartet_matrix(norb: int) -> np.ndarray:
+    rows = []
+    for orbital_1b in SPECTATOR_1B:
+        row = np.zeros(norb, dtype=np.uint8)
+        row[orbital_1b - 1] = 1
+        rows.append(row)
+    for first_1b, second_1b in QUARTETS_1B:
+        row = np.zeros(norb, dtype=np.uint8)
+        row[first_1b - 1] = 1
+        row[second_1b - 1] = 1
+        rows.append(row)
+    return np.asarray(rows, dtype=np.uint8)
+
+
+def cas_matrix(norb: int) -> np.ndarray:
+    """Fix alpha and beta occupations of the four inactive orbitals."""
+    rows = []
+    for orbital_1b in INACTIVE_1B:
+        orbital = orbital_1b - 1
+        for spin_offset in (0, 1):
+            row = np.zeros(2 * norb, dtype=np.uint8)
+            row[2 * orbital + spin_offset] = 1
+            rows.append(row)
+    return np.asarray(rows, dtype=np.uint8)
+
+
+def family_sectors(family: str, norb: int, nelec: tuple[int, int]) -> dict:
+    """Build exact determinant supports for one N2/STO-3G parity family."""
+    seniority = symmetry_sectors(seniority_matrix(norb), norb, nelec)
+    if family == "all-even":
+        label = (0,) * norb
+        return {label: seniority[label]}
+    if family == "seniority":
+        return seniority
+    if family == "quartet":
+        return symmetry_sectors(quartet_matrix(norb), norb, nelec)
+    if family == "cas":
+        sectors = symmetry_sectors(cas_matrix(norb), norb, nelec)
+        label = (1,) * (2 * len(INACTIVE_1B))
+        return {label: sectors[label]}
+    raise ValueError(f"Unsupported family: {family}")
+
+
+def label_text(label: tuple[int, ...]) -> str:
+    return "".join(str(int(bit)) for bit in label)
+
+
+def full_fci_energy(moldata: ffsim.MolecularData) -> float:
+    """Obtain the full fixed-spin FCI energy without materializing its matrix."""
+    linop = ffsim.linear_operator(
+        moldata.hamiltonian,
+        norb=moldata.norb,
+        nelec=moldata.nelec,
     )
-    rhf = RHFData(
-        mol=mol,
-        mf=mf,
-        n_orb=int(mf.mo_coeff.shape[1]),
-        n_elec=int(mol.nelectron),
-        n_alpha=int(mol.nelec[0]),
-        n_beta=int(mol.nelec[1]),
-        mo_occ=np.asarray(mf.mo_occ),
-        mo_energy=np.asarray(mf.mo_energy),
-    )
-    return transform_integrals(rhf, np.eye(rhf.n_orb))
+    energy = eigsh(linop, k=1, which="SA", tol=1.0e-11, return_eigenvectors=False)
+    return float(np.real(energy[0]))
+
+
+def scan_initial_sector_energies(
+    moldata: ffsim.MolecularData,
+    sectors: dict,
+    params: np.ndarray,
+    *,
+    family: str,
+) -> list[tuple[float, tuple[int, ...], int]]:
+    """Exactly rank canonical-frame sectors while reporting long scans."""
+    hamiltonian = rotated_hamiltonian_linop(moldata, params)
+    total = len(sectors)
+    results = []
+    for number, (label, support) in enumerate(sectors.items(), start=1):
+        energy = sector_ground_energy(hamiltonian, support)
+        results.append((energy, label, len(support)))
+        if total > 1 and (number == 1 or number % 25 == 0 or number == total):
+            print(
+                f"  [{family}] canonical sector scan {number}/{total}; "
+                f"current dim={len(support)}",
+                flush=True,
+            )
+    results.sort(key=lambda item: item[0])
+    return results
 
 
 def atomic_json_dump(path: Path, value: dict) -> None:
@@ -225,23 +250,18 @@ def selected_family_result(
     *,
     family: str,
     point_dir: Path,
-    integrals,
-    basis,
+    moldata: ffsim.MolecularData,
+    reference_energy: float,
     args,
 ) -> tuple[dict, np.ndarray]:
+    """Optimize exactly one support: the canonical-frame lowest sector."""
     family_dir = point_dir / family
     family_dir.mkdir(parents=True, exist_ok=True)
     selected_path = family_dir / "selected.json"
     selected_rotation_path = family_dir / "selected_rotation.npy"
     settings = {
-        "optimization_mode": "fixed-branches",
-        "fixed_sector_branches": 1,
-        "screen_sectors": bool(args.screen_sectors),
-        "screen_top_k": int(args.screen_top_k),
-        "screen_beta": float(args.screen_beta),
-        "screen_low_window": float(args.screen_low_window),
-        "screen_keep_lowest": int(args.screen_keep_lowest),
-        "screen_final_full_check": bool(args.screen_final_full_check),
+        "backend": "quasisymmetry_ffsim",
+        "optimization_mode": "fixed-initial-lowest-sector",
         "maxiter": None if args.no_maxiter else int(args.maxiter),
         "maxfev": args.maxfev,
     }
@@ -261,36 +281,54 @@ def selected_family_result(
         payload = None
 
     if payload is None:
-        screen = SectorScreeningConfig(
-            enabled=bool(args.screen_sectors),
-            top_k=int(args.screen_top_k),
-            energy_window=None,
-            beta=float(args.screen_beta),
-            low_window=float(args.screen_low_window),
-            keep_lowest_per_sector=int(args.screen_keep_lowest),
-            final_full_check=bool(args.screen_final_full_check),
-        )
+        sectors = family_sectors(family, moldata.norb, moldata.nelec)
+        zero_params = np.zeros(moldata.norb * (moldata.norb - 1) // 2)
+        initial_energy, initial_label, support_dim = scan_initial_sector_energies(
+            moldata, sectors, zero_params, family=family
+        )[0]
+        support = sectors[initial_label]
         print(
-            f"  [{family}] optimizing the initially lowest sector "
-            f"screen={args.screen_sectors}",
+            f"  [{family}] initial lowest sector={label_text(initial_label)} "
+            f"dim={support_dim} E={initial_energy:.12f} Ha; optimizing fixed support",
             flush=True,
         )
+        evaluations = 0
+
+        def objective(params: np.ndarray) -> float:
+            nonlocal evaluations
+            evaluations += 1
+            return float(fixed_sector_energy(moldata, support, params))
+
+        options = {"maxiter": None if args.no_maxiter else args.maxiter, "xtol": 1.0e-4, "ftol": 1.0e-8}
+        if options["maxiter"] is None:
+            options.pop("maxiter")
+        if args.maxfev is not None:
+            options["maxfev"] = args.maxfev
         started = time.perf_counter()
-        item = optimize_family(
-            family=family,
-            base_integrals=integrals,
-            basis=basis,
-            compute_spectral_range=False,
-            maxiter=None if args.no_maxiter else args.maxiter,
-            maxfev=args.maxfev,
-            screen=screen,
-            optimization_mode="fixed-branches",
-            fixed_sector_branches=1,
-        )
-        rotation = np.asarray(item.pop("rotation"))
-        item["start_label"] = "exact_initial_lowest_sector"
-        item["optimization_settings"] = settings
-        item["driver_wall_time_s"] = time.perf_counter() - started
+        result = minimize(objective, zero_params, method="Powell", options=options)
+        elapsed = time.perf_counter() - started
+        final_energy = float(fixed_sector_energy(moldata, support, result.x))
+        rotation = params_to_U(result.x, moldata.norb)
+        item = {
+            "family": family,
+            "method": FAMILY_LABELS[family],
+            "backend": "quasisymmetry_ffsim",
+            "success": bool(result.success),
+            "message": str(result.message),
+            "energy_ha": final_energy,
+            "error_mha_vs_rotated_fci": 1000.0 * (final_energy - reference_energy),
+            "sector": label_text(initial_label),
+            "sector_bits": list(initial_label),
+            "support_dim": int(support_dim),
+            "initial_energy_ha": float(initial_energy),
+            "function_evaluations": int(evaluations),
+            "iterations": int(result.nit),
+            "seconds": float(elapsed),
+            "parameters": np.asarray(result.x).tolist(),
+            "start_label": "exact_initial_lowest_sector",
+            "optimization_settings": settings,
+            "rotation": rotation,
+        }
         payload = save_candidate(raw_path, item, rotation)
 
     result = dict(payload)
@@ -311,7 +349,6 @@ def selected_family_result(
     result["selected_at"] = timestamp()
     atomic_json_dump(selected_path, result)
     return result, rotation
-
 
 def write_csv(path: Path, rows: list[dict]) -> None:
     if not rows:
@@ -565,12 +602,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--maxiter", type=int, default=60)
     parser.add_argument("--no-maxiter", action="store_true")
     parser.add_argument("--maxfev", type=int, default=None)
-    parser.add_argument("--screen-sectors", action="store_true")
-    parser.add_argument("--screen-top-k", type=int, default=24)
-    parser.add_argument("--screen-beta", type=float, default=4.0)
-    parser.add_argument("--screen-low-window", type=float, default=2.0)
-    parser.add_argument("--screen-keep-lowest", type=int, default=8)
-    parser.add_argument("--screen-final-full-check", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
@@ -599,7 +630,6 @@ def main() -> None:
     configuration = {
         "created_at": timestamp(),
         "script": str(Path(__file__).resolve()),
-        "canonical_single_sector_project": str(SINGLE_SECTOR_PROJECT),
         "system": "n2",
         "basis": args.basis,
         "grid_angstrom": grid,
@@ -608,9 +638,8 @@ def main() -> None:
         "maxiter": args.maxiter,
         "no_maxiter": bool(args.no_maxiter),
         "maxfev": args.maxfev,
-        "optimization_mode": "fixed-branches",
-        "fixed_sector_branches": 1,
-        "screen_sectors": bool(args.screen_sectors),
+        "backend": "quasisymmetry_ffsim",
+        "optimization_mode": "fixed-initial-lowest-sector",
         "reference": "Full fixed-spin FCI recomputed at every geometry",
         "output_dir": str(args.output_dir),
     }
@@ -662,44 +691,39 @@ def main() -> None:
         )
         point_dir = args.output_dir / "points" / geometry_key(distance)
         point_dir.mkdir(parents=True, exist_ok=True)
-        geometry = build_n2_geometry(distance)
-        integrals = build_integrals_with_rhf_fallback(
-            geometry,
-            args.basis,
-            charge=0,
-            multiplicity=1,
-        )
-        if integrals.n_orb != 10 or integrals.n_alpha != 7 or integrals.n_beta != 7:
+        mf, moldata = build_molecular_data(build_n2_geometry(distance), args.basis)
+        if moldata.norb != 10 or moldata.nelec != (7, 7):
             raise RuntimeError(
                 "Expected N2/STO-3G with 10 spatial orbitals and (7,7) electrons; "
-                f"got n_orb={integrals.n_orb}, nelec=({integrals.n_alpha},{integrals.n_beta})."
+                f"got n_orb={moldata.norb}, nelec={moldata.nelec}."
             )
-        basis = build_spin_string_basis(integrals.n_orb, integrals.n_alpha, integrals.n_beta)
+        full_dimension = comb(moldata.norb, moldata.nelec[0]) * comb(moldata.norb, moldata.nelec[1])
         reference_path = point_dir / "reference.json"
         if args.resume and reference_path.is_file():
             reference = load_json(reference_path)
             print(f"  [reference] FCI={reference['fci_energy_ha']:.12f} Ha; reusing", flush=True)
         else:
-            canonical, fci_energy, ranks = reference_only_results(integrals, basis)
+            started = time.perf_counter()
+            fci_energy = full_fci_energy(moldata)
             reference = {
                 "r_nn_angstrom": float(distance),
                 "basis": args.basis,
-                "hf_energy_ha": float(integrals.mf.e_tot),
+                "hf_energy_ha": float(mf.e_tot),
                 "fci_energy_ha": float(fci_energy),
-                "fixed_spin_dimension": int(basis.full_dimension),
-                "ranks": ranks,
-                "reference_rows": [asdict(row) for row in canonical],
+                "fixed_spin_dimension": int(full_dimension),
+                "backend": "ffsim_sparse_eigsh",
+                "seconds": time.perf_counter() - started,
                 "completed_at": timestamp(),
             }
             atomic_json_dump(reference_path, reference)
             print(f"  [reference] FCI={fci_energy:.12f} Ha", flush=True)
 
         for family in families:
-            result, rotation = selected_family_result(
+            result, _rotation = selected_family_result(
                 family=family,
                 point_dir=point_dir,
-                integrals=integrals,
-                basis=basis,
+                moldata=moldata,
+                reference_energy=float(reference["fci_energy_ha"]),
                 args=args,
             )
             print(
@@ -736,7 +760,6 @@ def main() -> None:
     print(f"Report: {args.output_dir / 'summary.md'}", flush=True)
     print(f"Energy plot: {args.output_dir / 'energy_curves.png'}", flush=True)
     print(f"Error plot: {args.output_dir / 'error_curves.png'}", flush=True)
-
 
 if __name__ == "__main__":
     main()
