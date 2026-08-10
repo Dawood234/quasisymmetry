@@ -4,7 +4,6 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=64G
 #SBATCH --time=12:00:00
 #SBATCH --signal=B:USR1@300
 
