@@ -14,12 +14,14 @@ import tempfile
 import unittest
 from math import comb
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import openfermion as of
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import src.dmrg_solver as dmrg_solver_module
 from src.dmrg_solver import (
     Block2DMRGSolver,
     DMRGConfig,
@@ -33,6 +35,55 @@ from src.dmrg_decoupled_energy import energy_from_rdms
 
 FCIDUMP_PATH = Path(__file__).resolve().parents[1] / "hamiltonians" / "sentest_5_d754.FCIDUMP"
 ENERGY_TOL = 1e-7
+
+
+def test_activate_finalizes_previous_block2_driver(tmp_path):
+    class FakeDriver:
+        def __init__(self, **kwargs):
+            self.finalized = False
+
+        def initialize_system(self, **kwargs):
+            pass
+
+        def finalize(self):
+            self.finalized = True
+
+    previous = object.__new__(Block2DMRGSolver)
+    previous_driver = FakeDriver()
+    previous.driver = previous_driver
+    previous._hamiltonian_mpo = object()
+    previous._electronic_hamiltonian_mpo = object()
+
+    current = object.__new__(Block2DMRGSolver)
+    current.driver = None
+    current.store_dir = tmp_path / "current"
+    current.store_dir.mkdir()
+    current.symmetry_mode = "sz"
+    current.n_threads = 1
+    current.n_mkl_threads = 1
+    current.stack_mem_bytes = 1024
+    current.restart_dir = None
+    current.n_sites = 2
+    current.n_elec = 2
+    current.spin = 0
+    current.target_irrep = 0
+    current.orbital_symmetries = None
+    current._hamiltonian_mpo = None
+    current._electronic_hamiltonian_mpo = None
+
+    old_active = dmrg_solver_module._ACTIVE_SOLVER
+    try:
+        dmrg_solver_module._ACTIVE_SOLVER = previous
+        with mock.patch.object(dmrg_solver_module, "DMRGDriver", FakeDriver):
+            current._activate()
+        assert previous_driver.finalized
+        assert previous.driver is None
+        assert previous._hamiltonian_mpo is None
+        assert previous._electronic_hamiltonian_mpo is None
+        assert current.driver is not None
+        assert dmrg_solver_module._ACTIVE_SOLVER is current
+    finally:
+        dmrg_solver_module._ACTIVE_SOLVER = old_active
 
 
 def test_find_sector_determinant_satisfies_spin_and_parities():

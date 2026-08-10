@@ -591,6 +591,14 @@ class Block2DMRGSolver:
         global _ACTIVE_SOLVER
         if _ACTIVE_SOLVER is self and self.driver is not None:
             return
+        if _ACTIVE_SOLVER is not None and _ACTIVE_SOLVER.driver is not None:
+            # Block2 owns one process-global frame.  Finalize it before creating
+            # the next driver or repeated orbital-objective evaluations retain
+            # every old frame and eventually exhaust node memory.
+            _ACTIVE_SOLVER.driver.finalize()
+            _ACTIVE_SOLVER.driver = None
+            _ACTIVE_SOLVER._hamiltonian_mpo = None
+            _ACTIVE_SOLVER._electronic_hamiltonian_mpo = None
         self.driver = DMRGDriver(
             scratch=str(self.store_dir),
             symm_type=(
