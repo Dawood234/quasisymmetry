@@ -58,15 +58,23 @@ def comma_separated_floats(text: str) -> tuple[float, ...]:
     return tuple(float(value) for value in text.split(",") if value.strip())
 
 
+def input_reader_store(store_dir: str | Path | None) -> Path | None:
+    """Keep the temporary integral reader beside an explicit writable store."""
+    if store_dir is None:
+        return None
+    return Path(store_dir) / "_input_reader"
+
+
 def build_solver(args: argparse.Namespace) -> Block2DMRGSolver:
     """Create the solver from .FCIDUMP (block2-only) or .chk (needs pyscf)."""
     molpath = Path(args.molpath)
+    reader_store = input_reader_store(args.store_dir)
     if molpath.suffix == ".chk":
         from chemistry import fcidump_data  # requires pyscf
 
         dumpdata = fcidump_data(str(molpath))
         base = Block2DMRGSolver.from_dumpdata(
-            dumpdata, store_dir=None, n_threads=args.n_threads,
+            dumpdata, store_dir=reader_store, n_threads=args.n_threads,
             save_integrals=False,
         )
         h1e, g2e, ecore = base.h1e, base.g2e, base.ecore
@@ -74,7 +82,7 @@ def build_solver(args: argparse.Namespace) -> Block2DMRGSolver:
     elif molpath.suffix == ".FCIDUMP" or molpath.name.endswith("FCIDUMP"):
         base = Block2DMRGSolver.from_fcidump(
             molpath,
-            store_dir=None,
+            store_dir=reader_store,
             n_threads=args.n_threads,
             point_group=args.point_group,
             save_integrals=False,

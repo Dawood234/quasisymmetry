@@ -2,12 +2,20 @@
 
 import numpy as np
 
+from solve_dmrg import input_reader_store
 from src.dmrg_solver import (
     DMRGConfig,
     find_sector_determinant,
     permute_orbital_symmetries,
     rotation_preserves_orbital_symmetries,
 )
+
+
+def test_explicit_dmrg_store_also_contains_temporary_input_reader(tmp_path):
+    store = tmp_path / "mps"
+
+    assert input_reader_store(store) == store / "_input_reader"
+    assert input_reader_store(None) is None
 
 
 def test_default_schedule_reaches_requested_bond_dimension():
