@@ -86,6 +86,17 @@ def test_activate_finalizes_previous_block2_driver(tmp_path):
         dmrg_solver_module._ACTIVE_SOLVER = old_active
 
 
+def test_sector_hamiltonian_rejects_su2_mode():
+    solver = object.__new__(Block2DMRGSolver)
+    solver.symmetry_mode = "su2"
+    with np.testing.assert_raises(NotImplementedError):
+        solver.sector_hamiltonian_mpo(
+            np.asarray([[1, 0]], dtype=int),
+            (0,),
+            penalty=30.0,
+        )
+
+
 def test_find_sector_determinant_satisfies_spin_and_parities():
     parity_matrix = np.asarray(
         [

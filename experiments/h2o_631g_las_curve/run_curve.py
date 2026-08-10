@@ -57,6 +57,7 @@ def parse_args():
     parser.add_argument("--multiply-bond-dim", type=int, default=100)
     parser.add_argument("--multiply-sweeps", type=int, default=8)
     parser.add_argument("--dmrg-threads", type=int, default=32)
+    parser.add_argument("--dmrg-stack-mem-gb", type=float, default=4.0)
     parser.add_argument("--sector-bond-dim", type=int, default=100)
     parser.add_argument("--sector-sweeps", type=int, default=6)
     parser.add_argument("--sector-penalty", type=float, default=30.0)
@@ -523,9 +524,11 @@ def final_sector_dmrg(args, artifacts, branch, output_dir):
         orbital_permutation=base.orbital_permutation,
         orbital_symmetries=base.orbital_symmetries,
         target_irrep=base.target_irrep,
-        symmetry_mode=base.symmetry_mode,
+        # The parity penalty is a spin-resolved SZ operator.  The reusable
+        # parent may be SU(2), but the selected-sector solver must be SZ.
+        symmetry_mode="sz",
         n_mkl_threads=1,
-        stack_mem_bytes=base.stack_mem_bytes,
+        stack_mem_bytes=int(args.dmrg_stack_mem_gb * 1024**3),
     )
     parity_canonical = np.asarray(branch["selection"]["parity_matrix"], dtype=int)
     parity_solver = map_rows_to_solver_order(

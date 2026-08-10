@@ -1239,6 +1239,11 @@ class Block2DMRGSolver:
         sector ``sigma_k = (-1)**sector_label[k]`` is obtained without
         cross-sector contamination.
         """
+        if self.symmetry_mode != "sz":
+            raise NotImplementedError(
+                "parity-sector Hamiltonians require symmetry_mode='sz'; "
+                "the spin-resolved c/d/C/D expression is not an SU(2) MPO"
+            )
         parity_matrix = np.atleast_2d(np.asarray(parity_matrix, dtype=int))
         sector_label = tuple(int(b) for b in sector_label)
         if len(sector_label) != parity_matrix.shape[0]:
