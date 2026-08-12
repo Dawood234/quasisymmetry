@@ -12,8 +12,10 @@ orbital-optimized one-sector models against full STO-3G FCI:
 
 Every geometry and family is checkpointed independently. The seniority and
 quartet families are scanned exactly in the canonical frame, and only their
-single lowest sector is orbital optimized. No coupled-sector calculation or
-previously saved LAS energy is used.
+single lowest sector is orbital optimized. An optional second pass refits each
+point from cached neighboring rotations and keeps the lowest converged result;
+this is a local-minimum/branch-tracking aid, not a coupled-sector calculation.
+No previously saved LAS energy is used.
 """
 
 from __future__ import annotations
@@ -22,8 +24,10 @@ import argparse
 import csv
 from dataclasses import asdict
 from datetime import datetime
+import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -41,7 +45,7 @@ DEFAULT_OUTPUT = (
     / "quasisymmetry"
     / "h2o"
     / "sto-3g"
-    / "single_sector_initial_lowest_curves_20260801"
+    / "single_sector_continuation_curves_20260801"
 )
 
 
@@ -79,7 +83,11 @@ from single_sector_oo.backends.integrals import (
     rotate_integrals,
     transform_integrals,
 )
-from single_sector_oo.backends.rotations import params_to_rotation, zero_rotation_params
+from single_sector_oo.backends.rotations import (
+    params_to_rotation,
+    rotation_to_params,
+    zero_rotation_params,
+)
 from single_sector_oo.backends.systems import build_h2o_geometry
 from single_sector_oo.workflows.h2o.run_h2o_sto3g_parity_casscf_generalization import (
     best_row,
@@ -151,6 +159,21 @@ def parse_grid(text: str) -> list[float]:
     if len(set(values)) != len(values):
         raise ValueError("The O-H distance grid contains duplicates.")
     return sorted(values)
+
+
+def refine_grid(values: list[float], max_step: float | None) -> list[float]:
+    """Add evenly spaced points without dropping any requested geometry."""
+    if max_step is None:
+        return list(values)
+    if max_step <= 0.0:
+        raise ValueError("--refine-step must be positive.")
+
+    refined: set[float] = set(values)
+    for left, right in zip(values, values[1:]):
+        intervals = max(1, int(math.ceil((right - left) / max_step)))
+        for index in range(intervals + 1):
+            refined.add(left + (right - left) * index / intervals)
+    return sorted(refined)
 
 
 def parse_families(text: str) -> list[str]:
@@ -250,6 +273,14 @@ def save_candidate(path: Path, item: dict, rotation: np.ndarray) -> dict:
     return payload
 
 
+def rotation_fingerprint(rotation: np.ndarray | None) -> str:
+    """Identify an optimizer seed so resume cannot reuse a stale continuation."""
+    if rotation is None:
+        return "identity"
+    array = np.asarray(rotation, dtype=np.float64)
+    return hashlib.sha256(array.tobytes()).hexdigest()
+
+
 def load_candidate(path: Path) -> tuple[dict, np.ndarray]:
     payload = load_json(path)
     rotation_path = Path(payload["rotation_path"])
@@ -266,6 +297,8 @@ def optimize_initial_lowest_sector(
     reference_energy: float,
     maxiter: int | None,
     maxfev: int | None,
+    initial_rotation: np.ndarray | None,
+    start_label: str,
 ) -> dict:
     """Freeze the initially lowest support and optimize only that sector."""
     final_family, groups, label_to_text, label_to_description, rank = (
@@ -307,10 +340,15 @@ def optimize_initial_lowest_sector(
         options["maxiter"] = int(maxiter)
     if maxfev is not None:
         options["maxfev"] = int(maxfev)
+    initial_params = (
+        zero_rotation_params(base_integrals.n_orb)
+        if initial_rotation is None
+        else rotation_to_params(initial_rotation)
+    )
     started = time.perf_counter()
     result = minimize(
         objective,
-        zero_rotation_params(base_integrals.n_orb),
+        initial_params,
         method="Powell",
         options=options,
     )
@@ -324,6 +362,7 @@ def optimize_initial_lowest_sector(
         "family": family,
         "initial_sector": initial_row.sector,
         "initial_energy_ha": initial_row.energy_ha,
+        "initial_guess": start_label,
         "success": bool(result.success),
         "message": str(result.message),
         "energy_ha": energy,
@@ -335,6 +374,7 @@ def optimize_initial_lowest_sector(
         "seconds": elapsed,
         "assembly_seconds": assembly_seconds,
         "diagonalization_seconds": diagonalization_seconds,
+        "parameters": np.asarray(result.x).tolist(),
         "rotation": rotation,
     }
 
@@ -346,6 +386,8 @@ def selected_family_result(
     integrals,
     basis,
     reference_energy: float,
+    previous_rotation: np.ndarray | None,
+    extra_starts: list[tuple[str, np.ndarray]] | None,
     args,
 ) -> tuple[dict, np.ndarray]:
     family_dir = point_dir / family
@@ -353,29 +395,44 @@ def selected_family_result(
     selected_path = family_dir / "selected.json"
     selected_rotation_path = family_dir / "selected_rotation.npy"
     settings = {
-        "optimization_mode": "fixed-branches",
-        "fixed_sector_branches": 1,
+        "optimization_mode": "fixed-initial-lowest-sector",
+        "continuation": True,
         "reference_energy_hartree": float(reference_energy),
         "maxiter": None if args.no_maxiter else int(args.maxiter),
         "maxfev": args.maxfev,
     }
 
-    raw_path = family_dir / "raw_result.json"
-    if args.resume and raw_path.is_file():
-        payload, rotation = load_candidate(raw_path)
-        if payload.get("optimization_settings") != settings:
-            print(f"  [{family}] settings changed; recomputing raw result", flush=True)
-            payload = None
-        elif bool(payload.get("success")):
-            print(f"  [{family}] complete; reusing raw result", flush=True)
-        else:
-            print(f"  [{family}] raw optimization was unconverged; retrying", flush=True)
-            payload = None
-    else:
-        payload = None
+    starts = [("identity", None)]
+    if previous_rotation is not None:
+        starts.append(("continuation", previous_rotation))
+    for start_label, initial_rotation in extra_starts or []:
+        if any(existing_label == start_label for existing_label, _ in starts):
+            raise ValueError(f"Duplicate optimization start label: {start_label}")
+        starts.append((start_label, np.asarray(initial_rotation)))
 
-    if payload is None:
-        print(f"  [{family}] optimizing the initially lowest sector", flush=True)
+    candidates: list[tuple[dict, np.ndarray]] = []
+    for start_label, initial_rotation in starts:
+        candidate_path = family_dir / f"start_{start_label}.json"
+        expected_seed = rotation_fingerprint(initial_rotation)
+        if args.resume and candidate_path.is_file():
+            candidate, rotation = load_candidate(candidate_path)
+            cached_seed = candidate.get("initial_rotation_sha256")
+            seed_matches = cached_seed == expected_seed or (
+                start_label == "identity" and cached_seed is None
+            )
+            if (
+                candidate.get("optimization_settings") == settings
+                and candidate.get("success")
+                and seed_matches
+            ):
+                print(f"  [{family}] {start_label} complete; reusing", flush=True)
+                candidates.append((candidate, rotation))
+                continue
+
+        print(
+            f"  [{family}] optimizing initially lowest sector from {start_label}",
+            flush=True,
+        )
         started = time.perf_counter()
         item = optimize_initial_lowest_sector(
             family=family,
@@ -384,26 +441,41 @@ def selected_family_result(
             reference_energy=reference_energy,
             maxiter=None if args.no_maxiter else args.maxiter,
             maxfev=args.maxfev,
+            initial_rotation=initial_rotation,
+            start_label=start_label,
         )
         rotation = np.asarray(item.pop("rotation"))
-        item["start_label"] = "exact_initial_lowest_sector"
         item["optimization_settings"] = settings
+        item["initial_rotation_sha256"] = expected_seed
         item["driver_wall_time_s"] = time.perf_counter() - started
-        payload = save_candidate(raw_path, item, rotation)
+        candidate = save_candidate(candidate_path, item, rotation)
+        candidates.append((candidate, rotation))
+
+    if not candidates:
+        raise RuntimeError(f"No completed optimization candidate for {family}.")
+
+    payload, rotation = min(candidates, key=lambda pair: float(pair[0]["energy_ha"]))
 
     result = dict(payload)
     result["family"] = family
     result["method"] = FAMILY_LABELS[family]
+    result["start_label"] = result["initial_guess"]
     result["candidate_results"] = [
         {
-            "source": result["start_label"],
-            "energy_ha": result["energy_ha"],
-            "error_mha": result["error_mha_vs_rotated_fci"],
-            "sector": result["sector"],
-            "success": result["success"],
-            "function_evaluations": result["function_evaluations"],
+            "source": candidate["initial_guess"],
+            "energy_ha": candidate["energy_ha"],
+            "error_mha": candidate["error_mha_vs_rotated_fci"],
+            "sector": candidate["sector"],
+            "success": candidate["success"],
+            "function_evaluations": candidate["function_evaluations"],
         }
+        for candidate, _candidate_rotation in candidates
     ]
+    result["selection_strategy"] = (
+        "identity-plus-continuation"
+        if not extra_starts
+        else "identity-continuation-neighbor-envelope"
+    )
     np.save(selected_rotation_path, rotation)
     result["selected_rotation_path"] = str(selected_rotation_path)
     result["selected_at"] = timestamp()
@@ -414,8 +486,13 @@ def selected_family_result(
 def write_csv(path: Path, rows: list[dict]) -> None:
     if not rows:
         return
+    fieldnames = []
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
     with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -475,6 +552,7 @@ def write_report(output_dir: Path, rows: list[dict], references: list[dict], fam
         "- `CASSCF-like CAS(4e,4o)`: three inactive orbitals are doubly occupied and four electrons move in four active orbitals.",
         "- `Seniority + quartets`: two quartet products resolve correlated broken-pair channels while three spectators keep individual seniorities.",
         "- Seniority and quartet sectors are ranked exactly in the canonical frame; only the initially lowest fixed sector is optimized for each family.",
+        "- With `--neighbor-refit`, the forward continuation result is refit from cached left/right geometry rotations and the lowest converged candidate is retained pointwise. This envelope pass is unavailable to independent array tasks.",
         "",
         "## Curve summary",
         "",
@@ -495,15 +573,15 @@ def write_report(output_dir: Path, rows: list[dict], references: list[dict], fam
             "",
             "## Pointwise optimized sectors",
             "",
-            "| rOH (A) | method | sector | dimension | energy (Ha) | error (mHa) | converged | route |",
-            "|---:|---|---|---:|---:|---:|---|---|",
+            "| rOH (A) | method | sector | dimension | energy (Ha) | error (mHa) | converged | route | candidates |",
+            "|---:|---|---|---:|---:|---:|---|---|---|",
         ]
     )
     for row in rows:
         lines.append(
             f"| {row['r_oh_angstrom']:.4f} | {row['method']} | `{row['sector']}` | "
             f"{row['support_dim']} | {row['energy_ha']:.12f} | {row['error_mha']:.6f} | "
-            f"{row['success']} | {row['selected_start']} |"
+            f"{row['success']} | {row['selected_start']} | {row['candidate_starts']} |"
         )
     lines.extend(
         [
@@ -641,6 +719,10 @@ def collect_completed(output_dir: Path, grid: list[float], families: list[str]) 
                         "iterations": int(item["iterations"]),
                         "seconds": float(item["seconds"]),
                         "selected_start": item["start_label"],
+                        "candidate_starts": ";".join(
+                            candidate["source"]
+                            for candidate in item.get("candidate_results", [])
+                        ),
                     }
                 )
     rows.sort(key=lambda row: (row["r_oh_angstrom"], FAMILY_ORDER.index(row["family"])))
@@ -664,8 +746,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--maxiter", type=int, default=60)
     parser.add_argument("--no-maxiter", action="store_true")
     parser.add_argument("--maxfev", type=int, default=None)
+    parser.add_argument(
+        "--refine-step",
+        type=float,
+        default=None,
+        help=(
+            "Subdivide each requested grid interval to at most this step in "
+            "Angstrom; preserves all explicitly requested points."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--neighbor-refit",
+        action="store_true",
+        help=(
+            "After the forward continuation pass, refit each point from the "
+            "cached neighboring rotations and select the lowest result. "
+            "Requires a full sequential grid, not --no-aggregate array tasks."
+        ),
+    )
+    parser.add_argument(
+        "--neighbor-refit-passes",
+        type=int,
+        default=1,
+        help="Maximum pointwise neighbor-envelope passes (default: 1).",
+    )
     parser.add_argument(
         "--no-aggregate",
         action="store_true",
@@ -682,10 +788,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    grid = parse_grid(args.grid)
+    requested_grid = parse_grid(args.grid)
+    grid = refine_grid(requested_grid, args.refine_step)
     families = parse_families(args.families)
     if args.no_aggregate and args.aggregate_only:
         raise ValueError("--no-aggregate and --aggregate-only are mutually exclusive.")
+    if args.no_aggregate and args.neighbor_refit:
+        raise ValueError(
+            "--neighbor-refit requires a full sequential grid; it cannot run "
+            "inside an independent --no-aggregate array task."
+        )
+    if args.neighbor_refit_passes < 1:
+        raise ValueError("--neighbor-refit-passes must be at least one.")
     args.output_dir = args.output_dir.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -696,14 +810,18 @@ def main() -> None:
         "system": "h2o",
         "basis": args.basis,
         "angle_deg": args.angle,
+        "requested_grid_angstrom": requested_grid,
         "grid_angstrom": grid,
+        "refine_step_angstrom": args.refine_step,
         "families": families,
         "family_labels": {family: FAMILY_LABELS[family] for family in families},
         "maxiter": args.maxiter,
         "no_maxiter": bool(args.no_maxiter),
         "maxfev": args.maxfev,
-        "optimization_mode": "fixed-branches",
-        "fixed_sector_branches": 1,
+        "optimization_mode": "fixed-initial-lowest-sector",
+        "continuation": True,
+        "neighbor_refit": bool(args.neighbor_refit),
+        "neighbor_refit_passes": int(args.neighbor_refit_passes),
         "reference": "Full fixed-spin FCI recomputed at every geometry",
         "output_dir": str(args.output_dir),
     }
@@ -746,6 +864,9 @@ def main() -> None:
         print(f"Error plot: {args.output_dir / 'error_curves.png'}", flush=True)
         return
 
+    previous_rotations: dict[str, np.ndarray] = {}
+    forward_rotations: dict[tuple[float, str], np.ndarray] = {}
+    point_contexts: dict[float, tuple[object, object, float]] = {}
     total_start = time.perf_counter()
     for point_number, distance in enumerate(grid, start=1):
         print("\n" + "=" * 78, flush=True)
@@ -811,6 +932,7 @@ def main() -> None:
             )
 
         reference_energy = float(reference["fci_energy_ha"])
+        point_contexts[distance] = (integrals, basis, reference_energy)
 
         for family in families:
             result, rotation = selected_family_result(
@@ -819,8 +941,12 @@ def main() -> None:
                 integrals=integrals,
                 basis=basis,
                 reference_energy=reference_energy,
+                previous_rotation=previous_rotations.get(family),
+                extra_starts=None,
                 args=args,
             )
+            previous_rotations[family] = rotation
+            forward_rotations[(distance, family)] = np.asarray(rotation)
             print(
                 f"  [{family}] sector={result['sector']} dim={result['support_dim']} "
                 f"E={result['energy_ha']:.12f} Ha "
@@ -832,6 +958,75 @@ def main() -> None:
             rows, references = collect_completed(args.output_dir, grid, families)
             write_report(args.output_dir, rows, references, families)
             make_plots(args.output_dir, rows, references, families)
+
+    if args.neighbor_refit and not args.no_aggregate:
+        print("\n" + "=" * 78, flush=True)
+        print(
+            f"[{timestamp()}] neighbor-refit/envelope pass "
+            f"(up to {args.neighbor_refit_passes} pass(es))",
+            flush=True,
+        )
+        envelope_rotations = dict(forward_rotations)
+        for pass_number in range(1, args.neighbor_refit_passes + 1):
+            source_rotations = dict(envelope_rotations)
+            updated_rotations: dict[tuple[float, str], np.ndarray] = {}
+            changed = False
+            print(
+                f"  [neighbor envelope] pass {pass_number}/"
+                f"{args.neighbor_refit_passes}",
+                flush=True,
+            )
+            for point_index, distance in enumerate(grid):
+                integrals, basis, reference_energy = point_contexts[distance]
+                point_dir = args.output_dir / "points" / geometry_key(distance)
+                for family in families:
+                    key = (distance, family)
+                    neighbor_starts: list[tuple[str, np.ndarray]] = []
+                    if point_index > 0:
+                        left = (grid[point_index - 1], family)
+                        if left in source_rotations:
+                            neighbor_starts.append(
+                                ("neighbor_previous", source_rotations[left])
+                            )
+                    if point_index + 1 < len(grid):
+                        right = (grid[point_index + 1], family)
+                        if right in source_rotations:
+                            neighbor_starts.append(
+                                ("neighbor_next", source_rotations[right])
+                            )
+                    if not neighbor_starts:
+                        updated_rotations[key] = source_rotations[key]
+                        continue
+
+                    result, rotation = selected_family_result(
+                        family=family,
+                        point_dir=point_dir,
+                        integrals=integrals,
+                        basis=basis,
+                        reference_energy=reference_energy,
+                        previous_rotation=source_rotations[key],
+                        extra_starts=neighbor_starts,
+                        args=args,
+                    )
+                    updated_rotations[key] = np.asarray(rotation)
+                    changed = changed or not np.allclose(
+                        updated_rotations[key], source_rotations[key], atol=1.0e-10
+                    )
+                    print(
+                        f"    [{family}] rOH={distance:.4f} "
+                        f"selected={result['start_label']} "
+                        f"E={result['energy_ha']:.12f} Ha",
+                        flush=True,
+                    )
+
+            envelope_rotations.update(updated_rotations)
+            if not changed:
+                print("  [neighbor envelope] stable; stopping early", flush=True)
+                break
+
+        rows, references = collect_completed(args.output_dir, grid, families)
+        write_report(args.output_dir, rows, references, families)
+        make_plots(args.output_dir, rows, references, families)
 
     if args.no_aggregate:
         print(f"Point task complete in {time.perf_counter() - total_start:.2f} s", flush=True)
